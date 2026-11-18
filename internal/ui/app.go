@@ -182,7 +182,7 @@ func (a *App) buildUI() {
 	dropBg := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
 	dropBg.CornerRadius = 6
 	dropText := widget.NewLabelWithStyle(
-		"Drop a .zip archive or folder anywhere on this window to scan for KiCad symbols, footprints & 3D models",
+		"Drop a .zip archive, folder, or KiCad project/schematic/PCB (.kicad_pro, .kicad_sch, .kicad_pcb) anywhere on this window to extract parts, footprints & 3D models",
 		fyne.TextAlignCenter,
 		fyne.TextStyle{Italic: true},
 	)

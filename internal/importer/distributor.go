@@ -315,7 +315,7 @@ func (n *NexarProvider) LookupByMPN(ctx context.Context, mpn string) (*PartMetad
 	}
 
 	gql := map[string]any{
-		"query": `query ($q: String!) { supSearchMpn(q: $q, limit: 1) { results { part { mpn shortDescription manufacturer { name } bestDatasheet { url } specs { attribute { name } displayValue } } } } }`,
+		"query":     `query ($q: String!) { supSearchMpn(q: $q, limit: 1) { results { part { mpn shortDescription manufacturer { name } bestDatasheet { url } specs { attribute { name } displayValue } } } } }`,
 		"variables": map[string]any{"q": mpn},
 	}
 	raw, _ := json.Marshal(gql)

@@ -884,3 +884,54 @@ func (d *DB) ListDistinctMetadataKeys() ([]string, error) {
 	}
 	return keys, rows.Err()
 }
+
+// FindDuplicateParts searches for existing parts matching by case-insensitive Name,
+// non-empty MPN, or non-empty LCSC Part ID. Matches in targetLibraryID are ordered first.
+func (d *DB) FindDuplicateParts(name, mpn, lcscPart string, targetLibraryID int64) ([]Part, error) {
+	name = strings.TrimSpace(name)
+	mpn = strings.TrimSpace(mpn)
+	lcscPart = strings.TrimSpace(lcscPart)
+	if name == "" && mpn == "" && lcscPart == "" {
+		return nil, nil
+	}
+
+	rows, err := d.conn.Query(`
+		SELECT p.id, p.uuid, p.library_id, l.name, p.name, p.value, p.description, p.keywords,
+		       p.datasheet, p.mpn, p.manufacturer, p.lcsc_part, p.source_type, p.source_ref,
+		       p.created_at, p.updated_at
+		FROM parts p
+		JOIN libraries l ON l.id = p.library_id
+		WHERE (? != '' AND LOWER(p.name) = LOWER(?))
+		   OR (? != '' AND p.mpn != '' AND LOWER(p.mpn) = LOWER(?))
+		   OR (? != '' AND p.lcsc_part != '' AND LOWER(p.lcsc_part) = LOWER(?))
+		ORDER BY CASE WHEN p.library_id = ? THEN 0 ELSE 1 END, LOWER(p.name) ASC
+		LIMIT 20`,
+		name, name, mpn, mpn, lcscPart, lcscPart, targetLibraryID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Part
+	for rows.Next() {
+		var p Part
+		if err := rows.Scan(
+			&p.ID, &p.UUID, &p.LibraryID, &p.LibraryName, &p.Name, &p.Value, &p.Description, &p.Keywords,
+			&p.Datasheet, &p.MPN, &p.Manufacturer, &p.LCSCPart, &p.SourceType, &p.SourceRef,
+			&p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := d.hydratePartRelations(&out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}

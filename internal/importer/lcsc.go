@@ -23,9 +23,9 @@ const (
 type easyedaComponentResponse struct {
 	Success bool `json:"success"`
 	Result  struct {
-		UUID          string `json:"uuid"`
-		Title         string `json:"title"`
-		Description   string `json:"description"`
+		UUID          string         `json:"uuid"`
+		Title         string         `json:"title"`
+		Description   string         `json:"description"`
 		DataStr       easyedaDataStr `json:"dataStr"`
 		PackageDetail *struct {
 			Title   string         `json:"title"`

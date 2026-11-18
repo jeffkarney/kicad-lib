@@ -339,3 +339,136 @@ func TestSyncFromKiCadExistingLibraries(t *testing.T) {
 		t.Fatalf("expected unchanged sync to skip, got libs=%d parts=%d", libsSynced2, partsSynced2)
 	}
 }
+
+func TestDuplicateDetectionAndMergePart(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad-cfg"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib, err := database.CreateLibrary("MCUs", "Microcontrollers")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stepA := filepath.Join(tmp, "a.step")
+	stepB := filepath.Join(tmp, "b.step")
+	_ = os.WriteFile(stepA, []byte("ISO-10303-21;\nEND-ISO-10303-21;\n"), 0o644)
+	_ = os.WriteFile(stepB, []byte("ISO-10303-21;\nEND-ISO-10303-21;\n"), 0o644)
+
+	symV1 := `(symbol "STM32F405RGT6"
+		(in_bom yes)
+		(on_board yes)
+		(property "Reference" "U" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "STM32F405RGT6" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+		(symbol "STM32F405RGT6_1_1"
+			(pin input line (at -5.08 0 0) (length 2.54) (name "VDD" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+		)
+	)`
+	fpNew := `(footprint "LQFP-64"
+		(layer "F.Cu")
+		(attr smd)
+		(pad "1" smd rect (at -1 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask"))
+	)`
+
+	orig, err := mgr.ImportPart(ImportPartRequest{
+		LibraryID:    lib.ID,
+		PartName:     "STM32F405RGT6",
+		Value:        "STM32F405RGT6",
+		Description:  "ARM Cortex-M4 MCU",
+		MPN:          "STM32F405RGT6",
+		Manufacturer: "STMicroelectronics",
+		SourceType:   "drop",
+		SymbolName:   "STM32F405RGT6",
+		SymbolSExpr:  symV1,
+		Models3D:     []ImportModel3D{{SourcePath: stepA, FileName: "a.step", Format: "step"}},
+		Metadata:     map[string]string{"Voltage": "3.3V", "Package": "LQFP-64"},
+	})
+	if err != nil {
+		t.Fatalf("initial ImportPart failed: %v", err)
+	}
+
+	// Duplicate detection by exact name & by MPN
+	dupsByName, err := database.FindDuplicateParts("stm32f405rgt6", "", "", lib.ID)
+	if err != nil || len(dupsByName) != 1 || dupsByName[0].ID != orig.ID {
+		t.Fatalf("expected duplicate match by name, got %+v (err=%v)", dupsByName, err)
+	}
+	dupsByMPN, err := database.FindDuplicateParts("AliasPart", "STM32F405RGT6", "", lib.ID)
+	if err != nil || len(dupsByMPN) != 1 || dupsByMPN[0].ID != orig.ID {
+		t.Fatalf("expected duplicate match by MPN, got %+v (err=%v)", dupsByMPN, err)
+	}
+	if dupsByMPN[0].Symbol == nil || dupsByMPN[0].Metadata["Voltage"] != "3.3V" {
+		t.Fatalf("expected hydrated relations on duplicate match: %+v", dupsByMPN[0])
+	}
+
+	incReq := ImportPartRequest{
+		LibraryID:      lib.ID,
+		PartName:       "STM32F405RGT6",
+		Description:    "High-performance MCU",
+		LCSCPart:       "C15742",
+		SourceType:     "drop",
+		FootprintName:  "LQFP-64",
+		FootprintSExpr: fpNew,
+		Models3D:       []ImportModel3D{{SourcePath: stepB, FileName: "b.step", Format: "step"}},
+		Metadata:       map[string]string{"Package": "LQFP-64-EP", "Temp": "-40..85C"},
+	}
+
+	// 1. Skip strategy leaves original unchanged
+	skipped, err := mgr.MergePart(orig.ID, incReq, MergeOptions{Strategy: "skip"})
+	if err != nil || skipped.Footprint != nil {
+		t.Fatalf("expected skip strategy to leave part unchanged, err=%v", err)
+	}
+
+	// 2. Selective merge: keep existing symbol, take incoming footprint, combine 3D models, prefer incoming metadata
+	merged, err := mgr.MergePart(orig.ID, incReq, MergeOptions{
+		Strategy:             "merge",
+		UseIncomingDetails:   true,
+		UseIncomingSymbol:    false,
+		UseIncomingFootprint: true,
+		Model3DMode:          "combine",
+		MetadataMode:         "prefer_incoming",
+	})
+	if err != nil {
+		t.Fatalf("MergePart failed: %v", err)
+	}
+	if merged.Symbol == nil || merged.Symbol.PinCount != 1 {
+		t.Fatalf("expected existing symbol retained on merge, got %+v", merged.Symbol)
+	}
+	if merged.Footprint == nil || merged.Footprint.Name != "LQFP-64" {
+		t.Fatalf("expected incoming footprint added on merge, got %+v", merged.Footprint)
+	}
+	if len(merged.Models3D) != 2 {
+		t.Fatalf("expected 2 combined 3D models (a.step, b.step), got %d", len(merged.Models3D))
+	}
+	if merged.Metadata["Voltage"] != "3.3V" || merged.Metadata["Package"] != "LQFP-64-EP" || merged.Metadata["Temp"] != "-40..85C" {
+		t.Fatalf("unexpected merged metadata: %+v", merged.Metadata)
+	}
+	if merged.LCSCPart != "C15742" {
+		t.Fatalf("expected incoming LCSC ID merged, got %q", merged.LCSCPart)
+	}
+
+	// 3. Rename strategy creates a distinct new part in the library
+	renamed, err := mgr.MergePart(orig.ID, incReq, MergeOptions{
+		Strategy: "rename",
+	})
+	if err != nil {
+		t.Fatalf("MergePart rename failed: %v", err)
+	}
+	if renamed.ID == orig.ID || renamed.Name != "STM32F405RGT6_2" {
+		t.Fatalf("expected renamed copy STM32F405RGT6_2, got id=%d name=%q", renamed.ID, renamed.Name)
+	}
+}

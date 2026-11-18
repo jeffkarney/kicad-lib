@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -20,14 +21,15 @@ import (
 )
 
 // ShowDropStagingDialog presents discovered symbols, footprints, 3D models, and metadata
-// from a dropped zip/folder, Git repo, or LCSC lookup, allowing the user to pick an existing
-// KiCad library or create a new library before importing and syncing.
+// from a dropped zip/folder/KiCad project/schematic/PCB, Git repo, or LCSC lookup, allowing the user
+// to pick an existing KiCad library or create a new library, inspect & resolve duplicate parts,
+// and import/merge & sync.
 func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *importer.ScanResult, onImported func()) {
 	if res == nil || len(res.Candidates) == 0 {
 		if res != nil {
 			res.Cleanup()
 		}
-		msg := "No KiCad symbols (.kicad_sym / .lib) or footprints (.kicad_mod) were found."
+		msg := "No KiCad symbols (.kicad_sym / .lib / .kicad_sch), footprints (.kicad_mod / .kicad_pcb), or KiCad projects (.kicad_pro) were found."
 		if res != nil && len(res.Warnings) > 0 {
 			msg += "\n\nWarnings:\n" + strings.Join(res.Warnings, "\n")
 		}
@@ -37,8 +39,10 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 
 	libs, _ := mgr.DB().ListLibraries()
 	libNames := make([]string, 0, len(libs))
+	libIDByName := make(map[string]int64, len(libs))
 	for _, l := range libs {
 		libNames = append(libNames, l.Name)
+		libIDByName[l.Name] = l.ID
 	}
 
 	// Target library selection vs inline creation
@@ -54,15 +58,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	newLibDescEntry.SetPlaceHolder("Optional library description")
 
 	newLibBox := container.NewVBox(newLibNameEntry, newLibDescEntry)
-	targetModeRadio := widget.NewRadioGroup([]string{modeExisting, modeNew}, func(sel string) {
-		if sel == modeNew {
-			existingSelect.Hide()
-			newLibBox.Show()
-		} else {
-			existingSelect.Show()
-			newLibBox.Hide()
-		}
-	})
+	targetModeRadio := widget.NewRadioGroup([]string{modeExisting, modeNew}, nil)
 	if len(libNames) > 0 {
 		targetModeRadio.SetSelected(modeExisting)
 		newLibBox.Hide()
@@ -70,6 +66,36 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		targetModeRadio.SetSelected(modeNew)
 		existingSelect.Hide()
 	}
+
+	currentTargetLibID := func() int64 {
+		if targetModeRadio.Selected == modeNew {
+			return libIDByName[strings.TrimSpace(newLibNameEntry.Text)]
+		}
+		return libIDByName[existingSelect.Selected]
+	}
+
+	// Duplicate tracking per candidate
+	resolutions := make([]CandidateResolution, len(res.Candidates))
+
+	// Duplicate notification banner & per-candidate status bar
+	dupBannerLbl := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	dupBannerLbl.Wrapping = fyne.TextWrapWord
+	dupBannerBg := canvas.NewRectangle(theme.Color(theme.ColorNameWarning))
+	dupBannerBg.CornerRadius = 4
+
+	var candDupBtn *widget.Button
+	dupBannerCompareBtn := widget.NewButton("Compare Active Duplicate...", nil)
+	dupBanner := container.NewStack(
+		dupBannerBg,
+		container.NewPadded(container.NewBorder(nil, nil, widget.NewIcon(theme.WarningIcon()), dupBannerCompareBtn, dupBannerLbl)),
+	)
+	dupBanner.Hide()
+
+	candDupStatusLbl := widget.NewLabel("")
+	candDupStatusLbl.Wrapping = fyne.TextWrapWord
+	candDupBtn = widget.NewButtonWithIcon("Compare & Merge Duplicate...", theme.WarningIcon(), nil)
+	candDupBar := container.NewBorder(nil, nil, nil, candDupBtn, candDupStatusLbl)
+	candDupBar.Hide()
 
 	// Candidate selection & active candidate editor
 	activeIdx := 0
@@ -99,7 +125,9 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	metaValEntry := widget.NewEntry()
 	metaValEntry.SetPlaceHolder("Value")
 
+	var candList *widget.List
 	var suppressSync bool
+
 	refreshMetaPreview := func(c *importer.CandidatePart) {
 		if len(c.Metadata) == 0 {
 			metaPreviewLbl.SetText("(no custom metadata)")
@@ -115,6 +143,170 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			lines = append(lines, fmt.Sprintf("%s = %s", k, c.Metadata[k]))
 		}
 		metaPreviewLbl.SetText(strings.Join(lines, "\n"))
+	}
+
+	updateActiveCandidateDupBar := func() {
+		if activeIdx < 0 || activeIdx >= len(resolutions) {
+			candDupBar.Hide()
+			return
+		}
+		r := resolutions[activeIdx]
+		if len(r.AllMatches) == 0 {
+			candDupBar.Hide()
+			return
+		}
+		candDupBar.Show()
+		ex := r.DuplicatePart
+		if ex == nil {
+			ex = &r.AllMatches[0]
+		}
+		if r.Resolved {
+			candDupStatusLbl.SetText(fmt.Sprintf("Duplicate [%s] %s — Resolved: %s", ex.LibraryName, ex.Name, strings.ToUpper(r.Options.Strategy)))
+		} else {
+			candDupStatusLbl.SetText(fmt.Sprintf("⚠ Matches existing part [%s] %s (%d match(es))", ex.LibraryName, ex.Name, len(r.AllMatches)))
+		}
+	}
+
+	updateBannerCounts := func() {
+		dupCount := 0
+		unresolvedCount := 0
+		for _, r := range resolutions {
+			if len(r.AllMatches) > 0 {
+				dupCount++
+				if !r.Resolved {
+					unresolvedCount++
+				}
+			}
+		}
+		if dupCount == 0 {
+			dupBanner.Hide()
+		} else {
+			if unresolvedCount > 0 {
+				dupBannerLbl.SetText(fmt.Sprintf("%d candidate part(s) match existing parts in your database (%d unresolved). Click Compare & Merge or Import to choose how to handle them.", dupCount, unresolvedCount))
+			} else {
+				dupBannerLbl.SetText(fmt.Sprintf("%d duplicate candidate(s) found — all resolved and ready to import/merge.", dupCount))
+			}
+			dupBanner.Show()
+			dupBanner.Refresh()
+		}
+		updateActiveCandidateDupBar()
+		if candList != nil {
+			candList.Refresh()
+		}
+	}
+
+	refreshCandidateDup := func(idx int, libID int64) {
+		if idx < 0 || idx >= len(res.Candidates) {
+			return
+		}
+		c := res.Candidates[idx]
+		matches, err := mgr.DB().FindDuplicateParts(c.PartName, c.MPN, c.LCSCPart, libID)
+		if err != nil {
+			matches = nil
+		}
+		prev := resolutions[idx]
+		resolutions[idx].AllMatches = matches
+		if len(matches) == 0 {
+			resolutions[idx].DuplicatePart = nil
+			resolutions[idx].Resolved = false
+			resolutions[idx].Options = storage.MergeOptions{}
+			return
+		}
+		if prev.DuplicatePart != nil {
+			stillPresent := false
+			for i := range matches {
+				if matches[i].ID == prev.DuplicatePart.ID {
+					mCopy := matches[i]
+					resolutions[idx].DuplicatePart = &mCopy
+					stillPresent = true
+					break
+				}
+			}
+			if !stillPresent {
+				mCopy := matches[0]
+				resolutions[idx].DuplicatePart = &mCopy
+				resolutions[idx].Resolved = false
+			}
+		} else {
+			mCopy := matches[0]
+			resolutions[idx].DuplicatePart = &mCopy
+		}
+	}
+
+	refreshAllDuplicates := func(libID int64) {
+		for i := range res.Candidates {
+			refreshCandidateDup(i, libID)
+		}
+		updateBannerCounts()
+	}
+
+	openCompareForIdx := func(idx int, onDone func()) {
+		if idx < 0 || idx >= len(res.Candidates) || len(resolutions[idx].AllMatches) == 0 {
+			if onDone != nil {
+				onDone()
+			}
+			return
+		}
+		ShowDuplicateCompareDialog(
+			parent, mgr, currentTargetLibID(),
+			&res.Candidates[idx], resolutions[idx].AllMatches, resolutions[idx].Options,
+			func(selectedMatch db.Part, opts storage.MergeOptions) {
+				resolutions[idx].DuplicatePart = &selectedMatch
+				resolutions[idx].Resolved = true
+				resolutions[idx].Options = opts
+				updateBannerCounts()
+				if onDone != nil {
+					onDone()
+				}
+			},
+		)
+	}
+
+	candDupBtn.OnTapped = func() {
+		openCompareForIdx(activeIdx, nil)
+	}
+
+	// Hook banner button cleanly so count label refreshes too
+	dupBannerCompareBtn.OnTapped = func() {
+		idx := activeIdx
+		if idx < 0 || idx >= len(resolutions) || len(resolutions[idx].AllMatches) == 0 {
+			idx = -1
+			for i, r := range resolutions {
+				if len(r.AllMatches) > 0 && !r.Resolved {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				for i, r := range resolutions {
+					if len(r.AllMatches) > 0 {
+						idx = i
+						break
+					}
+				}
+			}
+		}
+		if idx >= 0 {
+			candList.Select(idx)
+			openCompareForIdx(idx, nil)
+		}
+	}
+
+	targetModeRadio.OnChanged = func(sel string) {
+		if sel == modeNew {
+			existingSelect.Hide()
+			newLibBox.Show()
+		} else {
+			existingSelect.Show()
+			newLibBox.Hide()
+		}
+		refreshAllDuplicates(currentTargetLibID())
+	}
+	existingSelect.OnChanged = func(_ string) {
+		refreshAllDuplicates(currentTargetLibID())
+	}
+	newLibNameEntry.OnChanged = func(_ string) {
+		refreshAllDuplicates(currentTargetLibID())
 	}
 
 	loadCandidateIntoForm := func(idx int) {
@@ -156,12 +348,16 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			modelsLbl.SetText("(none attached)")
 		}
 		refreshMetaPreview(c)
+		updateActiveCandidateDupBar()
 	}
 
 	// Bind live edits back to res.Candidates[activeIdx]
 	nameEntry.OnChanged = func(s string) {
 		if !suppressSync {
 			res.Candidates[activeIdx].PartName = s
+			resolutions[activeIdx].Resolved = false
+			refreshCandidateDup(activeIdx, currentTargetLibID())
+			updateBannerCounts()
 		}
 	}
 	valEntry.OnChanged = func(s string) {
@@ -172,6 +368,9 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	mpnEntry.OnChanged = func(s string) {
 		if !suppressSync {
 			res.Candidates[activeIdx].MPN = s
+			resolutions[activeIdx].Resolved = false
+			refreshCandidateDup(activeIdx, currentTargetLibID())
+			updateBannerCounts()
 		}
 	}
 	mfgEntry.OnChanged = func(s string) {
@@ -182,6 +381,9 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	lcscEntry.OnChanged = func(s string) {
 		if !suppressSync {
 			res.Candidates[activeIdx].LCSCPart = s
+			resolutions[activeIdx].Resolved = false
+			refreshCandidateDup(activeIdx, currentTargetLibID())
+			updateBannerCounts()
 		}
 	}
 	dsEntry.OnChanged = func(s string) {
@@ -275,6 +477,8 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 				if target.Description == "" && found.Description != "" {
 					target.Description = found.Description
 				}
+				refreshCandidateDup(idx, currentTargetLibID())
+				updateBannerCounts()
 				if activeIdx == idx {
 					loadCandidateIntoForm(idx)
 				}
@@ -282,7 +486,6 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		}(activeIdx, q)
 	})
 
-	var candList *widget.List
 	candList = widget.NewList(
 		func() int { return len(res.Candidates) },
 		func() fyne.CanvasObject {
@@ -294,7 +497,6 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			c := &res.Candidates[id]
 			border := obj.(*fyne.Container)
-			// Border objects slice order: content first, then left/right/top/bottom
 			var chk *widget.Check
 			var lbl *widget.Label
 			for _, child := range border.Objects {
@@ -320,7 +522,15 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 				if len(c.Models3D) > 0 {
 					m3Tag = " +3D"
 				}
-				lbl.SetText(c.PartName + fpTag + m3Tag)
+				dupTag := ""
+				if id < len(resolutions) && len(resolutions[id].AllMatches) > 0 {
+					if resolutions[id].Resolved {
+						dupTag = " [✓ " + strings.ToUpper(resolutions[id].Options.Strategy) + "]"
+					} else {
+						dupTag = " [⚠ Duplicate]"
+					}
+				}
+				lbl.SetText(c.PartName + fpTag + m3Tag + dupTag)
 			}
 		},
 	)
@@ -341,6 +551,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		candList.Refresh()
 	})
 
+	refreshAllDuplicates(currentTargetLibID())
 	loadCandidateIntoForm(0)
 	candList.Select(0)
 
@@ -352,6 +563,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	)
 
 	rightForm := container.NewVScroll(container.NewVBox(
+		candDupBar,
 		widget.NewForm(
 			widget.NewFormItem("Part Name", nameEntry),
 			widget.NewFormItem("Value", valEntry),
@@ -381,14 +593,94 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	))
 
 	var dlg dialog.Dialog
-	importBtn := widget.NewButtonWithIcon("Import & Sync to KiCad", theme.ConfirmIcon(), func() {
-		var selected []importer.CandidatePart
-		for _, c := range res.Candidates {
-			if c.Selected {
-				selected = append(selected, c)
+	executeImport := func(targetLib *db.Library) {
+		var errs []string
+		importedCount := 0
+		mergedCount := 0
+		skippedCount := 0
+
+		for i, c := range res.Candidates {
+			if !c.Selected {
+				continue
+			}
+			var models []storage.ImportModel3D
+			for _, m := range c.Models3D {
+				models = append(models, storage.ImportModel3D{
+					SourcePath: m.SourcePath,
+					FileName:   m.FileName,
+					Format:     m.Format,
+				})
+			}
+			req := storage.ImportPartRequest{
+				LibraryID:           targetLib.ID,
+				PartName:            c.PartName,
+				Value:               c.Value,
+				Description:         c.Description,
+				Keywords:            c.Keywords,
+				Datasheet:           c.Datasheet,
+				MPN:                 c.MPN,
+				Manufacturer:        c.Manufacturer,
+				LCSCPart:            c.LCSCPart,
+				SourceType:          c.SourceType,
+				SourceRef:           c.SourceRef,
+				SymbolName:          c.SymbolName,
+				SymbolSourcePath:    c.SymbolSourcePath,
+				SymbolSExpr:         c.SymbolSExpr,
+				FootprintName:       c.FootprintName,
+				FootprintSourcePath: c.FootprintSourcePath,
+				FootprintSExpr:      c.FootprintSExpr,
+				Models3D:            models,
+				Metadata:            c.Metadata,
+			}
+
+			r := resolutions[i]
+			if r.DuplicatePart != nil && r.Resolved {
+				if strings.EqualFold(r.Options.Strategy, "skip") {
+					skippedCount++
+					continue
+				}
+				_, err := mgr.MergePart(r.DuplicatePart.ID, req, r.Options)
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("%s: %v", c.PartName, err))
+				} else if strings.EqualFold(r.Options.Strategy, "rename") {
+					importedCount++
+				} else {
+					mergedCount++
+				}
+			} else {
+				_, err := mgr.ImportPart(req)
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("%s: %v", c.PartName, err))
+				} else {
+					importedCount++
+				}
 			}
 		}
-		if len(selected) == 0 {
+
+		dlg.Hide()
+		summary := fmt.Sprintf("Library %q updated: %d imported, %d merged, %d skipped.", targetLib.Name, importedCount, mergedCount, skippedCount)
+		if len(errs) > 0 {
+			dialog.ShowInformation("Import Completed with Warnings",
+				summary+"\n\nErrors:\n"+strings.Join(errs, "\n"),
+				parent)
+		} else {
+			dialog.ShowInformation("Import Complete",
+				summary+"\n\nKiCad symbol, footprint, and 3D libraries synced.",
+				parent)
+		}
+		if onImported != nil {
+			onImported()
+		}
+	}
+
+	importBtn := widget.NewButtonWithIcon("Import & Sync to KiCad", theme.ConfirmIcon(), func() {
+		selectedCount := 0
+		for _, c := range res.Candidates {
+			if c.Selected {
+				selectedCount++
+			}
+		}
+		if selectedCount == 0 {
 			dialog.ShowInformation("No Parts Selected", "Check at least one part to import.", parent)
 			return
 		}
@@ -422,58 +714,34 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			}
 		}
 
-		var errs []string
-		importedCount := 0
-		for _, c := range selected {
-			var models []storage.ImportModel3D
-			for _, m := range c.Models3D {
-				models = append(models, storage.ImportModel3D{
-					SourcePath: m.SourcePath,
-					FileName:   m.FileName,
-					Format:     m.Format,
-				})
+		refreshAllDuplicates(targetLib.ID)
+
+		// Collect unresolved duplicates among selected candidates
+		var unresolvedQueue []int
+		for i, c := range res.Candidates {
+			if c.Selected && len(resolutions[i].AllMatches) > 0 && !resolutions[i].Resolved {
+				unresolvedQueue = append(unresolvedQueue, i)
 			}
-			_, err := mgr.ImportPart(storage.ImportPartRequest{
-				LibraryID:           targetLib.ID,
-				PartName:            c.PartName,
-				Value:               c.Value,
-				Description:         c.Description,
-				Keywords:            c.Keywords,
-				Datasheet:           c.Datasheet,
-				MPN:                 c.MPN,
-				Manufacturer:        c.Manufacturer,
-				LCSCPart:            c.LCSCPart,
-				SourceType:          c.SourceType,
-				SourceRef:           c.SourceRef,
-				SymbolName:          c.SymbolName,
-				SymbolSourcePath:    c.SymbolSourcePath,
-				SymbolSExpr:         c.SymbolSExpr,
-				FootprintName:       c.FootprintName,
-				FootprintSourcePath: c.FootprintSourcePath,
-				FootprintSExpr:      c.FootprintSExpr,
-				Models3D:            models,
-				Metadata:            c.Metadata,
-			})
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", c.PartName, err))
-			} else {
-				importedCount++
-			}
+		}
+		if len(unresolvedQueue) == 0 {
+			executeImport(targetLib)
+			return
 		}
 
-		dlg.Hide()
-		if len(errs) > 0 {
-			dialog.ShowInformation("Import Completed with Warnings",
-				fmt.Sprintf("Imported %d part(s) into %q.\n\nErrors:\n%s", importedCount, targetLib.Name, strings.Join(errs, "\n")),
-				parent)
-		} else {
-			dialog.ShowInformation("Import Complete",
-				fmt.Sprintf("Imported %d part(s) into %q and synced KiCad library files.", importedCount, targetLib.Name),
-				parent)
+		// Step sequentially through unresolved duplicates
+		var stepNext func(qPos int)
+		stepNext = func(qPos int) {
+			if qPos >= len(unresolvedQueue) {
+				executeImport(targetLib)
+				return
+			}
+			idx := unresolvedQueue[qPos]
+			candList.Select(idx)
+			openCompareForIdx(idx, func() {
+				stepNext(qPos + 1)
+			})
 		}
-		if onImported != nil {
-			onImported()
-		}
+		stepNext(0)
 	})
 	importBtn.Importance = widget.HighImportance
 
@@ -482,7 +750,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	})
 
 	body := container.NewBorder(
-		targetCard,
+		container.NewVBox(targetCard, dupBanner),
 		container.NewHBox(layout.NewSpacer(), cancelBtn, importBtn),
 		nil, nil,
 		split,
@@ -492,6 +760,6 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	dlg.SetOnClosed(func() {
 		res.Cleanup()
 	})
-	dlg.Resize(fyne.NewSize(900, 650))
+	dlg.Resize(fyne.NewSize(960, 680))
 	dlg.Show()
 }

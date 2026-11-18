@@ -32,40 +32,40 @@ type PartInspector struct {
 	emptyLabel *widget.Label
 	contentBox *fyne.Container
 
-	part       *db.Part
-	libraries  []db.Library
-	editMeta   map[string]string
-	metaKeys   []string
+	part      *db.Part
+	libraries []db.Library
+	editMeta  map[string]string
+	metaKeys  []string
 
-	titleLbl     *widget.Label
-	libBadge     *widget.Label
-	moveSelect   *widget.Select
-	moveBtn      *widget.Button
-	deleteBtn    *widget.Button
+	titleLbl   *widget.Label
+	libBadge   *widget.Label
+	moveSelect *widget.Select
+	moveBtn    *widget.Button
+	deleteBtn  *widget.Button
 
-	valEntry     *widget.Entry
-	mpnEntry     *widget.Entry
-	mfgEntry     *widget.Entry
-	lcscEntry    *widget.Entry
-	dsEntry      *widget.Entry
-	descEntry    *widget.Entry
-	kwEntry      *widget.Entry
-	saveInfoBtn  *widget.Button
+	valEntry    *widget.Entry
+	mpnEntry    *widget.Entry
+	mfgEntry    *widget.Entry
+	lcscEntry   *widget.Entry
+	dsEntry     *widget.Entry
+	descEntry   *widget.Entry
+	kwEntry     *widget.Entry
+	saveInfoBtn *widget.Button
 
-	symInfoLbl   *widget.Label
-	fpInfoLbl    *widget.Label
-	modelsLbl    *widget.Label
-	symPreview   *InteractivePreviewWidget
-	fpPreview    *InteractivePreviewWidget
-	m3dPreview   *InteractivePreviewWidget
-	modelSelect  *widget.Select
-	attach3DBtn  *widget.Button
+	symInfoLbl  *widget.Label
+	fpInfoLbl   *widget.Label
+	modelsLbl   *widget.Label
+	symPreview  *InteractivePreviewWidget
+	fpPreview   *InteractivePreviewWidget
+	m3dPreview  *InteractivePreviewWidget
+	modelSelect *widget.Select
+	attach3DBtn *widget.Button
 
-	metaListBox  *fyne.Container
-	newKeyEntry  *widget.Entry
-	newValEntry  *widget.Entry
-	enrichBtn    *widget.Button
-	saveMetaBtn  *widget.Button
+	metaListBox *fyne.Container
+	newKeyEntry *widget.Entry
+	newValEntry *widget.Entry
+	enrichBtn   *widget.Button
+	saveMetaBtn *widget.Button
 }
 
 // NewPartInspector builds the part inspector UI component.

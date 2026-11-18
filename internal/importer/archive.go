@@ -94,6 +94,7 @@ func ScanDroppedPaths(paths []string, kicadCLIPath string) (*ScanResult, error) 
 		TempWorkDir: tempDir,
 	}
 
+	origDirs := make(map[string]string)
 	var rootsToWalk []string
 	for idx, p := range paths {
 		info, err := os.Stat(p)
@@ -105,13 +106,17 @@ func ScanDroppedPaths(paths []string, kicadCLIPath string) (*ScanResult, error) 
 			rootsToWalk = append(rootsToWalk, p)
 			continue
 		}
-		if strings.EqualFold(filepath.Ext(p), ".zip") {
+		ext := strings.ToLower(filepath.Ext(p))
+		if ext == ".zip" {
 			extractDst := filepath.Join(tempDir, fmt.Sprintf("zip_%d", idx))
 			if err := extractZipRecursive(p, extractDst, 0, 3); err != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("extract %q: %v", filepath.Base(p), err))
 				continue
 			}
 			rootsToWalk = append(rootsToWalk, extractDst)
+		} else if ext == ".kicad_pro" {
+			// Dropping a KiCad project file scans the entire project directory for schematics, PCBs, libraries, and 3D models.
+			rootsToWalk = append(rootsToWalk, filepath.Dir(p))
 		} else {
 			// Single dropped file; copy into temp staging dir
 			dst := filepath.Join(tempDir, "single", filepath.Base(p))
@@ -119,11 +124,42 @@ func ScanDroppedPaths(paths []string, kicadCLIPath string) (*ScanResult, error) 
 				res.Warnings = append(res.Warnings, fmt.Sprintf("stage %q: %v", p, err))
 				continue
 			}
+			origDirs[dst] = filepath.Dir(p)
+			if ext == ".kicad_sch" {
+				stageHierarchicalSheets(p, filepath.Dir(p), filepath.Dir(dst), res.TempWorkDir, map[string]bool{filepath.Clean(p): true})
+			}
 			rootsToWalk = append(rootsToWalk, filepath.Dir(dst))
 		}
 	}
 
-	return scanDirectories(rootsToWalk, res, kicadCLIPath, "drop", strings.Join(paths, "; "))
+	return scanDirectories(rootsToWalk, res, kicadCLIPath, "drop", strings.Join(paths, "; "), origDirs)
+}
+
+func stageHierarchicalSheets(schPath, origRootDir, stageRootDir, _ string, visited map[string]bool) {
+	data, err := os.ReadFile(schPath)
+	if err != nil {
+		return
+	}
+	for _, rel := range kicad.ExtractSchematicSheetFiles(data) {
+		rel = strings.ReplaceAll(rel, "\\", string(filepath.Separator))
+		src := filepath.Clean(filepath.Join(filepath.Dir(schPath), rel))
+		if visited[src] {
+			continue
+		}
+		visited[src] = true
+		info, err := os.Stat(src)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		subRel, err := filepath.Rel(origRootDir, src)
+		if err != nil || strings.HasPrefix(subRel, "..") {
+			subRel = filepath.Base(src)
+		}
+		dst := filepath.Join(stageRootDir, subRel)
+		if err := copyFileSimple(src, dst); err == nil {
+			stageHierarchicalSheets(src, origRootDir, stageRootDir, "", visited)
+		}
+	}
 }
 
 // ScanDirectory scans an already-extracted directory (such as a cloned Git repository).
@@ -136,7 +172,7 @@ func ScanDirectory(dirPath, kicadCLIPath, sourceType, sourceRef string) (*ScanRe
 		VendorHint:  "Generic",
 		TempWorkDir: tempDir,
 	}
-	return scanDirectories([]string{dirPath}, res, kicadCLIPath, sourceType, sourceRef)
+	return scanDirectories([]string{dirPath}, res, kicadCLIPath, sourceType, sourceRef, nil)
 }
 
 type discoveredSymbol struct {
@@ -144,12 +180,15 @@ type discoveredSymbol struct {
 	sourcePath string
 }
 
-func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, sourceRef string) (*ScanResult, error) {
+func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, sourceRef string, origDirs map[string]string) (*ScanResult, error) {
 	var symFiles []string
 	var legacyLibFiles []string
 	var fpFiles []string
 	var modelFiles []string
 	var pdfFiles []string
+	var proFiles []string
+	var schFiles []string
+	var pcbFiles []string
 
 	seenFiles := make(map[string]bool)
 	for _, root := range roots {
@@ -183,26 +222,57 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 				modelFiles = append(modelFiles, path)
 			case ".pdf":
 				pdfFiles = append(pdfFiles, path)
+			case ".kicad_pro":
+				proFiles = append(proFiles, path)
+			case ".kicad_sch":
+				schFiles = append(schFiles, path)
+			case ".kicad_pcb":
+				pcbFiles = append(pcbFiles, path)
 			}
 			return nil
 		})
 	}
 
-	// Collect 3D models
-	for _, mf := range modelFiles {
-		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(mf)), ".")
+	if res.VendorHint == "Generic" {
+		switch {
+		case len(proFiles) > 0 || (len(schFiles) > 0 && len(pcbFiles) > 0):
+			res.VendorHint = "KiCad Project"
+		case len(schFiles) > 0:
+			res.VendorHint = "KiCad Schematic"
+		case len(pcbFiles) > 0:
+			res.VendorHint = "KiCad PCB"
+		}
+	}
+
+	// Collect 3D models already discovered in the dropped tree
+	seenModelPaths := make(map[string]bool)
+	addModelFile := func(mf string) {
+		clean := filepath.Clean(mf)
+		if seenModelPaths[clean] {
+			return
+		}
+		info, err := os.Stat(clean)
+		if err != nil || info.IsDir() {
+			return
+		}
+		seenModelPaths[clean] = true
+		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(clean)), ".")
 		if ext == "stp" {
 			ext = "step"
 		}
 		res.AllModels3D = append(res.AllModels3D, CandidateModel3D{
-			SourcePath: mf,
-			FileName:   filepath.Base(mf),
+			SourcePath: clean,
+			FileName:   filepath.Base(clean),
 			Format:     ext,
 		})
 	}
+	for _, mf := range modelFiles {
+		addModelFile(mf)
+	}
 	res.Datasheets = append(res.Datasheets, pdfFiles...)
 
-	// Collect footprints
+	// Collect standalone .kicad_mod footprints
+	seenFPNames := make(map[string]bool)
 	for _, fpf := range fpFiles {
 		data, err := os.ReadFile(fpf)
 		if err != nil {
@@ -220,8 +290,9 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 		}
 		var mRefs []string
 		for _, m := range pf.Models {
-			mRefs = append(mRefs, filepath.Base(m.Path))
+			mRefs = append(mRefs, filepath.Base(strings.ReplaceAll(m.Path, "\\", "/")))
 		}
+		seenFPNames[strings.ToLower(name)] = true
 		res.AllFootprints = append(res.AllFootprints, CandidateFootprint{
 			Name:       name,
 			SourcePath: fpf,
@@ -229,6 +300,67 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 			PadCount:   pf.PadCount,
 			ModelRefs:  mRefs,
 		})
+	}
+
+	// Extract embedded footprints and referenced 3D models from .kicad_pcb files
+	if len(pcbFiles) > 0 {
+		baseVars := kicad.ResolveKiCadVariables("", kicadCLIPath, nil)
+		pcbExtractDir := filepath.Join(res.TempWorkDir, "pcb_extracted.pretty")
+		_ = os.MkdirAll(pcbExtractDir, 0o755)
+		for _, pcbf := range pcbFiles {
+			data, err := os.ReadFile(pcbf)
+			if err != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("read pcb %q: %v", filepath.Base(pcbf), err))
+				continue
+			}
+			extractedFPs, err := kicad.ExtractFromPCB(data)
+			if err != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("extract pcb footprints %q: %v", filepath.Base(pcbf), err))
+				continue
+			}
+
+			prjDir := filepath.Dir(pcbf)
+			if od, ok := origDirs[pcbf]; ok && od != "" {
+				prjDir = od
+			}
+			localVars := make(map[string]string, len(baseVars)+1)
+			for k, v := range baseVars {
+				localVars[k] = v
+			}
+			localVars["KIPRJMOD"] = prjDir
+
+			for _, pf := range extractedFPs {
+				var mRefs []string
+				for _, m := range pf.Models {
+					rawModel := strings.ReplaceAll(strings.TrimSpace(m.Path), "\\", "/")
+					mRefs = append(mRefs, filepath.Base(rawModel))
+					expanded := kicad.ExpandKiCadURI(rawModel, localVars)
+					resolved := kicad.Resolve3DModelPath(expanded)
+					if resolved == expanded {
+						if _, statErr := os.Stat(resolved); statErr != nil && !filepath.IsAbs(expanded) {
+							resolved = kicad.Resolve3DModelPath(filepath.Join(prjDir, expanded))
+						}
+					}
+					addModelFile(resolved)
+				}
+
+				fpKey := strings.ToLower(pf.Name)
+				if pf.Name == "" || seenFPNames[fpKey] {
+					continue
+				}
+				seenFPNames[fpKey] = true
+				safeName := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(pf.Name)
+				stagedFP := filepath.Join(pcbExtractDir, safeName+".kicad_mod")
+				_ = os.WriteFile(stagedFP, []byte(pf.RawSExpr), 0o644)
+				res.AllFootprints = append(res.AllFootprints, CandidateFootprint{
+					Name:       pf.Name,
+					SourcePath: stagedFP,
+					RawSExpr:   pf.RawSExpr,
+					PadCount:   pf.PadCount,
+					ModelRefs:  mRefs,
+				})
+			}
+		}
 	}
 
 	// Upgrade legacy KiCad v5 .lib files
@@ -256,6 +388,7 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 
 	// Parse .kicad_sym files
 	var symbols []discoveredSymbol
+	seenSymNames := make(map[string]bool)
 	for _, sf := range symFiles {
 		data, err := os.ReadFile(sf)
 		if err != nil {
@@ -268,7 +401,56 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 			continue
 		}
 		for _, ps := range parsedSyms {
+			seenSymNames[strings.ToLower(ps.Name)] = true
 			symbols = append(symbols, discoveredSymbol{parsed: ps, sourcePath: sf})
+		}
+	}
+
+	// Extract symbols from .kicad_sch schematics (also recursively follow hierarchical sheets in folder/zip scans)
+	if len(schFiles) > 0 {
+		processedSch := make(map[string]bool)
+		queue := append([]string(nil), schFiles...)
+		for len(queue) > 0 {
+			sf := queue[0]
+			queue = queue[1:]
+			cleanSF := filepath.Clean(sf)
+			if processedSch[cleanSF] {
+				continue
+			}
+			processedSch[cleanSF] = true
+
+			data, err := os.ReadFile(cleanSF)
+			if err != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("read schematic %q: %v", filepath.Base(cleanSF), err))
+				continue
+			}
+			for _, rel := range kicad.ExtractSchematicSheetFiles(data) {
+				rel = strings.ReplaceAll(rel, "\\", string(filepath.Separator))
+				baseDir := filepath.Dir(cleanSF)
+				if od, ok := origDirs[sf]; ok && od != "" {
+					baseDir = od
+				}
+				subPath := filepath.Clean(filepath.Join(baseDir, rel))
+				if !processedSch[subPath] {
+					if info, sErr := os.Stat(subPath); sErr == nil && !info.IsDir() {
+						queue = append(queue, subPath)
+					}
+				}
+			}
+
+			extractedSyms, err := kicad.ExtractFromSchematic(data)
+			if err != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("extract schematic symbols %q: %v", filepath.Base(cleanSF), err))
+				continue
+			}
+			for _, ps := range extractedSyms {
+				symKey := strings.ToLower(ps.Name)
+				if ps.Name == "" || seenSymNames[symKey] {
+					continue
+				}
+				seenSymNames[symKey] = true
+				symbols = append(symbols, discoveredSymbol{parsed: ps, sourcePath: cleanSF})
+			}
 		}
 	}
 
@@ -339,7 +521,7 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 		if usedFootprints[idx] {
 			continue
 		}
-		if len(symbols) == 0 {
+		if len(symbols) == 0 || len(pcbFiles) > 0 || len(proFiles) > 0 {
 			cand := CandidatePart{
 				Selected:            true,
 				PartName:            fp.Name,
@@ -395,8 +577,8 @@ func matchFootprint(ps kicad.ParsedSymbol, fps []CandidateFootprint, singleSymbo
 			return i
 		}
 	}
-	// 4. Fallback if single footprint
-	if len(fps) == 1 {
+	// 4. Fallback if single footprint and either single symbol or no explicit Footprint reference
+	if len(fps) == 1 && (singleSymbol || fpRef == "") {
 		return 0
 	}
 	return -1

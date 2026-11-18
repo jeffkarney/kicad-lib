@@ -10,6 +10,7 @@ import (
 
 	"github.com/jeffk/kicad-lib/internal/config"
 	"github.com/jeffk/kicad-lib/internal/db"
+	"github.com/jeffk/kicad-lib/internal/importer"
 	"github.com/jeffk/kicad-lib/internal/kicad"
 	"github.com/jeffk/kicad-lib/internal/storage"
 )
@@ -137,4 +138,59 @@ Shape { geometry IndexedFaceSet { coord Coordinate { point [ 0 0 0, 2 0 0, 2 2 0
 	if pv3.cam3D.Zoom != 1.0 || pv3.cam3D.PanX != 0 {
 		t.Fatalf("expected reset camera state, got %+v", pv3.cam3D)
 	}
+}
+
+func TestDuplicateCompareDialogHeadless(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := storage.NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib, err := database.CreateLibrary("TestLib", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing, err := mgr.ImportPart(storage.ImportPartRequest{
+		LibraryID: lib.ID,
+		PartName:  "NE555",
+		Value:     "NE555",
+		MPN:       "NE555P",
+		Metadata:  map[string]string{"Package": "DIP-8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := test.NewApp()
+	defer a.Quit()
+	w := test.NewWindow(nil)
+	defer w.Close()
+
+	cand := &importer.CandidatePart{
+		PartName: "NE555",
+		Value:    "NE555",
+		MPN:      "NE555P",
+		Metadata: map[string]string{"Package": "SOIC-8", "Timer": "Precision"},
+	}
+	ShowDuplicateCompareDialog(w, mgr, lib.ID, cand, []db.Part{*existing}, storage.MergeOptions{Strategy: "merge"}, nil)
+
+	// Also verify staging dialog opens cleanly when duplicate candidates are present
+	scanRes := &importer.ScanResult{
+		VendorHint: "KiCad Project",
+		Candidates: []importer.CandidatePart{*cand},
+	}
+	ShowDropStagingDialog(w, mgr, scanRes, nil)
 }

@@ -341,6 +341,378 @@ func (m *Manager) ImportPart(req ImportPartRequest) (*db.Part, error) {
 	return m.db.GetPart(part.ID)
 }
 
+// MergeOptions controls how an incoming candidate part resolves against an existing part in the database.
+type MergeOptions struct {
+	Strategy             string // "merge", "overwrite", "rename", "skip"
+	NewName              string // target part name when Strategy == "rename"
+	UseIncomingDetails   bool   // prefer incoming Value, Description, Keywords, Datasheet, MPN, Manufacturer, LCSCPart
+	UseIncomingSymbol    bool   // replace existing symbol with incoming symbol
+	UseIncomingFootprint bool   // replace existing footprint with incoming footprint
+	Model3DMode          string // "combine", "keep_existing", "use_incoming"
+	MetadataMode         string // "prefer_incoming", "keep_existing", "replace"
+}
+
+// MergePart resolves a duplicate import against existingPartID using the specified merge strategy.
+func (m *Manager) MergePart(existingPartID int64, req ImportPartRequest, opts MergeOptions) (*db.Part, error) {
+	existing, err := m.db.GetPart(existingPartID)
+	if err != nil {
+		return nil, fmt.Errorf("load existing part %d: %w", existingPartID, err)
+	}
+
+	strategy := strings.ToLower(strings.TrimSpace(opts.Strategy))
+	if strategy == "" {
+		strategy = "merge"
+	}
+
+	switch strategy {
+	case "skip":
+		return existing, nil
+
+	case "rename":
+		newName := sanitizeFileComponent(strings.TrimSpace(opts.NewName))
+		if newName == "" {
+			newName = sanitizeFileComponent(strings.TrimSpace(req.PartName))
+		}
+		if newName == "" {
+			newName = existing.Name
+		}
+		if req.LibraryID == existing.LibraryID && strings.EqualFold(newName, existing.Name) {
+			newName = m.uniquePartNameInLibrary(req.LibraryID, newName)
+		} else {
+			newName = m.ensureUniquePartNameIfExists(req.LibraryID, newName)
+		}
+		req.PartName = newName
+		return m.ImportPart(req)
+
+	case "overwrite":
+		hasIncSym := strings.TrimSpace(req.SymbolSExpr) != "" || strings.TrimSpace(req.SymbolSourcePath) != ""
+		hasIncFP := strings.TrimSpace(req.FootprintSExpr) != "" || strings.TrimSpace(req.FootprintSourcePath) != ""
+		return m.MergePart(existingPartID, req, MergeOptions{
+			Strategy:             "merge",
+			UseIncomingDetails:   true,
+			UseIncomingSymbol:    hasIncSym,
+			UseIncomingFootprint: hasIncFP,
+			Model3DMode:          "use_incoming",
+			MetadataMode:         "replace",
+		})
+
+	case "merge":
+		if existing.SourceType == "kicad_sync" {
+			if err := m.materializePartToVault(existing); err != nil {
+				return nil, fmt.Errorf("materialize synced part to vault: %w", err)
+			}
+			if req.SourceType != "" && req.SourceType != "kicad_sync" {
+				existing.SourceType = req.SourceType
+			} else {
+				existing.SourceType = "manual"
+			}
+		}
+
+		lib, err := m.db.GetLibrary(existing.LibraryID)
+		if err != nil {
+			return nil, fmt.Errorf("lookup target library %d: %w", existing.LibraryID, err)
+		}
+
+		vaultPartDir := filepath.Join(m.cfg.VaultDir(), "parts", existing.UUID)
+		if err := os.MkdirAll(vaultPartDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create vault part dir: %w", err)
+		}
+
+		// 1. Scalar details
+		existing.Value = pickMergedField(existing.Value, req.Value, opts.UseIncomingDetails)
+		existing.Description = pickMergedField(existing.Description, req.Description, opts.UseIncomingDetails)
+		existing.Keywords = pickMergedField(existing.Keywords, req.Keywords, opts.UseIncomingDetails)
+		existing.MPN = pickMergedField(existing.MPN, req.MPN, opts.UseIncomingDetails)
+		existing.Manufacturer = pickMergedField(existing.Manufacturer, req.Manufacturer, opts.UseIncomingDetails)
+		existing.LCSCPart = pickMergedField(existing.LCSCPart, req.LCSCPart, opts.UseIncomingDetails)
+		chosenDS := pickMergedField(existing.Datasheet, req.Datasheet, opts.UseIncomingDetails)
+		if chosenDS != "" && !strings.HasPrefix(strings.ToLower(chosenDS), "http://") && !strings.HasPrefix(strings.ToLower(chosenDS), "https://") {
+			if !strings.HasPrefix(filepath.Clean(chosenDS), filepath.Clean(vaultPartDir)+string(os.PathSeparator)) {
+				if info, statErr := os.Stat(chosenDS); statErr == nil && !info.IsDir() {
+					dst := filepath.Join(vaultPartDir, filepath.Base(chosenDS))
+					if copyFile(chosenDS, dst) == nil {
+						chosenDS = dst
+					}
+				}
+			}
+		}
+		existing.Datasheet = chosenDS
+		if opts.UseIncomingDetails && strings.TrimSpace(req.SourceRef) != "" {
+			existing.SourceRef = req.SourceRef
+		}
+
+		// 2. Metadata
+		meta := make(map[string]string)
+		switch strings.ToLower(strings.TrimSpace(opts.MetadataMode)) {
+		case "replace":
+			for k, v := range req.Metadata {
+				if strings.TrimSpace(k) != "" {
+					meta[k] = v
+				}
+			}
+		case "keep_existing":
+			for k, v := range req.Metadata {
+				if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+					meta[k] = v
+				}
+			}
+			for k, v := range existing.Metadata {
+				if strings.TrimSpace(k) != "" {
+					meta[k] = v
+				}
+			}
+		default: // "prefer_incoming"
+			for k, v := range existing.Metadata {
+				if strings.TrimSpace(k) != "" {
+					meta[k] = v
+				}
+			}
+			for k, v := range req.Metadata {
+				if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+					meta[k] = v
+				}
+			}
+		}
+		if existing.MPN != "" && meta["MPN"] == "" {
+			meta["MPN"] = existing.MPN
+		}
+		if existing.Manufacturer != "" && meta["Manufacturer"] == "" {
+			meta["Manufacturer"] = existing.Manufacturer
+		}
+		if existing.LCSCPart != "" && meta["LCSC"] == "" {
+			meta["LCSC"] = existing.LCSCPart
+		}
+		existing.Metadata = meta
+
+		// 3. 3D Models
+		var stagedIncomingModels []db.Model3D
+		for _, m3 := range req.Models3D {
+			fname := filepath.Base(m3.FileName)
+			if fname == "" || fname == "." {
+				fname = filepath.Base(m3.SourcePath)
+			}
+			if fname == "" || fname == "." {
+				continue
+			}
+			vaultModelPath := filepath.Join(vaultPartDir, fname)
+			if m3.SourcePath != "" {
+				if err := copyFile(m3.SourcePath, vaultModelPath); err != nil {
+					return nil, fmt.Errorf("copy 3D model %q to vault: %w", m3.SourcePath, err)
+				}
+			}
+			format := strings.TrimPrefix(strings.ToLower(filepath.Ext(fname)), ".")
+			if format == "stp" {
+				format = "step"
+			}
+			if m3.Format != "" {
+				format = strings.ToLower(m3.Format)
+			}
+			sx, sy, sz := m3.ScaleX, m3.ScaleY, m3.ScaleZ
+			if sx == 0 && sy == 0 && sz == 0 {
+				sx, sy, sz = 1, 1, 1
+			}
+			stagedIncomingModels = append(stagedIncomingModels, db.Model3D{
+				FileName:  fname,
+				Format:    format,
+				VaultPath: vaultModelPath,
+				OffsetX:   m3.OffsetX, OffsetY: m3.OffsetY, OffsetZ: m3.OffsetZ,
+				ScaleX: sx, ScaleY: sy, ScaleZ: sz,
+				RotateX: m3.RotateX, RotateY: m3.RotateY, RotateZ: m3.RotateZ,
+			})
+		}
+
+		switch strings.ToLower(strings.TrimSpace(opts.Model3DMode)) {
+		case "keep_existing":
+			if len(existing.Models3D) == 0 && len(stagedIncomingModels) > 0 {
+				existing.Models3D = stagedIncomingModels
+			}
+		case "use_incoming":
+			if len(stagedIncomingModels) > 0 {
+				existing.Models3D = stagedIncomingModels
+			}
+		default: // "combine"
+			combined := make([]db.Model3D, 0, len(existing.Models3D)+len(stagedIncomingModels))
+			idxByName := make(map[string]int, len(existing.Models3D))
+			for _, em := range existing.Models3D {
+				idxByName[strings.ToLower(em.FileName)] = len(combined)
+				combined = append(combined, em)
+			}
+			for _, im := range stagedIncomingModels {
+				k := strings.ToLower(im.FileName)
+				if idx, exists := idxByName[k]; exists {
+					combined[idx] = im
+				} else {
+					idxByName[k] = len(combined)
+					combined = append(combined, im)
+				}
+			}
+			existing.Models3D = combined
+		}
+
+		// 4. Footprint
+		hasIncFP := strings.TrimSpace(req.FootprintSExpr) != "" || strings.TrimSpace(req.FootprintSourcePath) != ""
+		if (opts.UseIncomingFootprint || existing.Footprint == nil) && hasIncFP {
+			fpRaw := strings.TrimSpace(req.FootprintSExpr)
+			if fpRaw == "" && req.FootprintSourcePath != "" {
+				b, rerr := os.ReadFile(req.FootprintSourcePath)
+				if rerr != nil {
+					return nil, fmt.Errorf("read footprint %q: %w", req.FootprintSourcePath, rerr)
+				}
+				fpRaw = string(b)
+			}
+			parsedFP, perr := kicad.ParseFootprintFile([]byte(fpRaw))
+			if perr != nil {
+				return nil, fmt.Errorf("parse incoming footprint: %w", perr)
+			}
+			fpName := sanitizeFileComponent(strings.TrimSpace(req.FootprintName))
+			if fpName == "" {
+				fpName = sanitizeFileComponent(parsedFP.Name)
+			}
+			if fpName == "" {
+				fpName = existing.Name
+			}
+			vaultFPPath := filepath.Join(vaultPartDir, fpName+".kicad_mod")
+			if err := os.WriteFile(vaultFPPath, []byte(fpRaw), 0o644); err != nil {
+				return nil, fmt.Errorf("write vault footprint: %w", err)
+			}
+			existing.Footprint = &db.Footprint{
+				Name:      fpName,
+				RawSExpr:  fpRaw,
+				VaultPath: vaultFPPath,
+				PadCount:  parsedFP.PadCount,
+			}
+		}
+
+		// 5. Symbol
+		hasIncSym := strings.TrimSpace(req.SymbolSExpr) != "" || strings.TrimSpace(req.SymbolSourcePath) != ""
+		var symSourceRaw string
+		if (opts.UseIncomingSymbol || existing.Symbol == nil) && hasIncSym {
+			symSourceRaw = strings.TrimSpace(req.SymbolSExpr)
+			if symSourceRaw == "" && req.SymbolSourcePath != "" {
+				b, rerr := os.ReadFile(req.SymbolSourcePath)
+				if rerr != nil {
+					return nil, fmt.Errorf("read symbol %q: %w", req.SymbolSourcePath, rerr)
+				}
+				syms, perr := kicad.ParseSymbolLibrary(b)
+				if perr != nil {
+					return nil, fmt.Errorf("parse symbol %q: %w", req.SymbolSourcePath, perr)
+				}
+				if len(syms) > 0 {
+					sel := syms[0]
+					for _, s := range syms {
+						if s.Name == req.SymbolName {
+							sel = s
+							break
+						}
+					}
+					symSourceRaw = sel.RawSExpr
+				}
+			}
+		} else if existing.Symbol != nil {
+			symSourceRaw = existing.Symbol.RawSExpr
+		}
+
+		if symSourceRaw != "" {
+			syms, perr := kicad.ParseSymbolLibrary([]byte(symSourceRaw))
+			if perr != nil {
+				return nil, fmt.Errorf("parse symbol sexpr: %w", perr)
+			}
+			if len(syms) == 0 {
+				return nil, errors.New("symbol sexpr contained no symbol definition")
+			}
+			parsedSym := syms[0]
+			fpRef := ""
+			if existing.Footprint != nil {
+				fpRef = lib.Name + ":" + existing.Footprint.Name
+			}
+			preparedSym, perr := kicad.PrepareSymbolNode(
+				parsedSym.RawSExpr,
+				existing.Name,
+				fpRef,
+				existing.Value,
+				existing.Datasheet,
+				existing.Description,
+				existing.Keywords,
+				meta,
+			)
+			if perr != nil {
+				return nil, fmt.Errorf("prepare merged symbol: %w", perr)
+			}
+			vaultSymPath := filepath.Join(vaultPartDir, sanitizeFileComponent(existing.Name)+".kicad_sym")
+			if err := os.WriteFile(vaultSymPath, []byte(kicad.BuildSymbolLibraryFile([]string{preparedSym})), 0o644); err != nil {
+				return nil, fmt.Errorf("write vault symbol: %w", err)
+			}
+			existing.Symbol = &db.Symbol{
+				Name:      existing.Name,
+				RawSExpr:  preparedSym,
+				VaultPath: vaultSymPath,
+				PinCount:  parsedSym.PinCount,
+			}
+		}
+
+		if err := m.db.SavePart(existing); err != nil {
+			return nil, err
+		}
+		if err := m.RegenerateLibrary(existing.LibraryID); err != nil {
+			return nil, fmt.Errorf("regenerate library %q: %w", lib.Name, err)
+		}
+		m.invalidatePreviewCache(existing.UUID)
+		m.notifyIPC()
+		return m.db.GetPart(existing.ID)
+
+	default:
+		return nil, fmt.Errorf("unknown merge strategy %q", opts.Strategy)
+	}
+}
+
+func pickMergedField(existingVal, incomingVal string, preferIncoming bool) string {
+	cur := strings.TrimSpace(existingVal)
+	inc := strings.TrimSpace(incomingVal)
+	if preferIncoming {
+		if inc != "" {
+			return incomingVal
+		}
+		return existingVal
+	}
+	if cur != "" {
+		return existingVal
+	}
+	return incomingVal
+}
+
+func (m *Manager) uniquePartNameInLibrary(libraryID int64, base string) string {
+	existing, err := m.db.ListPartsByLibrary(libraryID)
+	if err != nil {
+		return base + "_2"
+	}
+	used := make(map[string]bool, len(existing))
+	for _, p := range existing {
+		used[strings.ToLower(p.Name)] = true
+	}
+	for n := 2; n < 10000; n++ {
+		cand := fmt.Sprintf("%s_%d", base, n)
+		if !used[strings.ToLower(cand)] {
+			return cand
+		}
+	}
+	return base + "_" + uuid.NewString()[:8]
+}
+
+func (m *Manager) ensureUniquePartNameIfExists(libraryID int64, candidate string) string {
+	existing, err := m.db.ListPartsByLibrary(libraryID)
+	if err != nil {
+		return candidate
+	}
+	used := make(map[string]bool, len(existing))
+	for _, p := range existing {
+		used[strings.ToLower(p.Name)] = true
+	}
+	if !used[strings.ToLower(candidate)] {
+		return candidate
+	}
+	return m.uniquePartNameInLibrary(libraryID, candidate)
+}
+
 // RegenerateLibrary rebuilds the .kicad_sym, .pretty, and .3dshapes files on disk for libraryID
 // from the SQLite database + immutable vault, and registers the library in KiCad's tables.
 func (m *Manager) RegenerateLibrary(libraryID int64) error {
