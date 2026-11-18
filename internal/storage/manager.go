@@ -796,15 +796,35 @@ func (m *Manager) RenderPartPreviews(part *db.Part) (symSVGPath, fpSVGPath strin
 		fpDir := filepath.Join(cacheDir, "fp")
 		prettyDir := filepath.Join(m.cfg.FootprintsDir(), part.LibraryName+".pretty")
 		managedFPFile := filepath.Join(prettyDir, sanitizeFileComponent(part.Footprint.Name)+".kicad_mod")
+		targetPrettyDir := ""
 		if _, statErr := os.Stat(managedFPFile); statErr == nil && part.SourceType != "kicad_sync" {
-			if p, e := kicad.ExportFootprintSVG(m.cfg.KiCadCLIPath, prettyDir, part.Footprint.Name, fpDir); e == nil {
-				fpSVGPath = p
-			}
+			targetPrettyDir = prettyDir
 		} else if part.Footprint.VaultPath != "" {
 			if _, statErr := os.Stat(part.Footprint.VaultPath); statErr == nil {
-				if p, e := kicad.ExportFootprintSVG(m.cfg.KiCadCLIPath, part.Footprint.VaultPath, part.Footprint.Name, fpDir); e == nil {
-					fpSVGPath = p
+				parentDir := filepath.Dir(part.Footprint.VaultPath)
+				if strings.HasSuffix(strings.ToLower(parentDir), ".pretty") {
+					targetPrettyDir = parentDir
+				} else {
+					tmpPretty := filepath.Join(cacheDir, "tmp.pretty")
+					_ = os.MkdirAll(tmpPretty, 0o755)
+					dstFP := filepath.Join(tmpPretty, sanitizeFileComponent(part.Footprint.Name)+".kicad_mod")
+					if copyFile(part.Footprint.VaultPath, dstFP) == nil {
+						targetPrettyDir = tmpPretty
+					}
 				}
+			}
+		}
+		if targetPrettyDir == "" && part.Footprint.RawSExpr != "" {
+			tmpPretty := filepath.Join(cacheDir, "tmp.pretty")
+			_ = os.MkdirAll(tmpPretty, 0o755)
+			dstFP := filepath.Join(tmpPretty, sanitizeFileComponent(part.Footprint.Name)+".kicad_mod")
+			if os.WriteFile(dstFP, []byte(part.Footprint.RawSExpr), 0o644) == nil {
+				targetPrettyDir = tmpPretty
+			}
+		}
+		if targetPrettyDir != "" {
+			if p, e := kicad.ExportFootprintSVG(m.cfg.KiCadCLIPath, targetPrettyDir, part.Footprint.Name, fpDir); e == nil {
+				fpSVGPath = p
 			}
 		}
 	}
@@ -915,7 +935,7 @@ func (m *Manager) SyncFromKiCad(onProgress func(SyncProgress)) (libsSynced int, 
 							PadCount:  pf.PadCount,
 						}
 						for _, mod := range pf.Models {
-							resolvedModPath := kicad.ExpandKiCadURI(mod.Path, vars)
+							resolvedModPath := kicad.Resolve3DModelPath(kicad.ExpandKiCadURI(mod.Path, vars))
 							ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(resolvedModPath)), ".")
 							if ext == "stp" {
 								ext = "step"

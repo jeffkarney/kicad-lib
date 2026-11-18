@@ -3,13 +3,13 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/jeffk/kicad-lib/internal/db"
 	"github.com/jeffk/kicad-lib/internal/importer"
+	"github.com/jeffk/kicad-lib/internal/kicad"
 	"github.com/jeffk/kicad-lib/internal/storage"
 )
 
@@ -54,8 +55,10 @@ type PartInspector struct {
 	symInfoLbl   *widget.Label
 	fpInfoLbl    *widget.Label
 	modelsLbl    *widget.Label
-	symPreview   *fyne.Container
-	fpPreview    *fyne.Container
+	symPreview   *InteractivePreviewWidget
+	fpPreview    *InteractivePreviewWidget
+	m3dPreview   *InteractivePreviewWidget
+	modelSelect  *widget.Select
 	attach3DBtn  *widget.Button
 
 	metaListBox  *fyne.Container
@@ -119,14 +122,23 @@ func NewPartInspector(win fyne.Window, mgr *storage.Manager, onChanged func()) *
 	pi.modelsLbl = widget.NewLabel("No 3D models")
 	pi.modelsLbl.Wrapping = fyne.TextWrapWord
 
-	pi.symPreview = container.NewStack()
-	pi.fpPreview = container.NewStack()
+	pi.symPreview = NewInteractivePreviewWidget(PreviewModeEmpty, fyne.NewSize(260, 200))
+	pi.fpPreview = NewInteractivePreviewWidget(PreviewModeEmpty, fyne.NewSize(260, 200))
+	pi.m3dPreview = NewInteractivePreviewWidget(PreviewModeEmpty, fyne.NewSize(260, 220))
+	pi.modelSelect = widget.NewSelect(nil, func(sel string) {
+		pi.loadSelected3DModel(sel)
+	})
+	pi.modelSelect.Hide()
 	pi.attach3DBtn = widget.NewButtonWithIcon("Attach 3D Model (.step/.wrl)...", theme.FolderOpenIcon(), pi.handleAttach3D)
 
+	symPanel := NewPreviewPanel(win, "Schematic Symbol", pi.symPreview, false)
+	fpPanel := NewPreviewPanel(win, "PCB Footprint", pi.fpPreview, false)
+	m3dPanel := NewPreviewPanel(win, "3D Model", pi.m3dPreview, true)
+
 	assetsTab := container.NewVScroll(container.NewVBox(
-		widget.NewCard("Schematic Symbol", "", container.NewVBox(pi.symInfoLbl, pi.symPreview)),
-		widget.NewCard("PCB Footprint", "", container.NewVBox(pi.fpInfoLbl, pi.fpPreview)),
-		widget.NewCard("3D Models", "", container.NewVBox(pi.modelsLbl, pi.attach3DBtn)),
+		widget.NewCard("Schematic Symbol", "", container.NewVBox(pi.symInfoLbl, symPanel)),
+		widget.NewCard("PCB Footprint", "", container.NewVBox(pi.fpInfoLbl, fpPanel)),
+		widget.NewCard("3D Model", "", container.NewVBox(pi.modelsLbl, pi.modelSelect, m3dPanel, pi.attach3DBtn)),
 	))
 
 	// Metadata Editor Tab
@@ -244,36 +256,120 @@ func (pi *PartInspector) SetPart(p *db.Part) {
 	}
 	pi.rebuildMetadataList()
 
-	// Render SVG previews asynchronously via kicad-cli
-	pi.symPreview.Objects = []fyne.CanvasObject{widget.NewLabel("Rendering preview...")}
-	pi.fpPreview.Objects = []fyne.CanvasObject{widget.NewLabel("Rendering preview...")}
-	pi.symPreview.Refresh()
-	pi.fpPreview.Refresh()
+	// Render interactive 2D Symbol preview (works immediately without SVG)
+	if p.Symbol != nil && (p.Symbol.RawSExpr != "" || p.Symbol.VaultPath != "") {
+		var d2 *kicad.Drawing2D
+		var err error
+		if p.Symbol.VaultPath != "" && strings.Contains(p.Symbol.RawSExpr, "(extends ") {
+			d2, err = kicad.ParseSymbolDrawingFromFile(p.Symbol.VaultPath, p.Symbol.Name)
+		}
+		if d2 == nil && p.Symbol.RawSExpr != "" {
+			d2, err = kicad.ParseSymbolDrawing(p.Symbol.RawSExpr)
+		}
+		if d2 == nil && p.Symbol.VaultPath != "" {
+			d2, err = kicad.ParseSymbolDrawingFromFile(p.Symbol.VaultPath, p.Symbol.Name)
+		}
+		if err == nil && d2 != nil {
+			pi.symPreview.SetDrawing2D(d2)
+		} else {
+			pi.symPreview.SetEmpty("Could not parse symbol geometry")
+		}
+	} else {
+		pi.symPreview.SetEmpty("No symbol attached")
+	}
 
+	// Render interactive 2D Footprint preview (works even without an SVG)
+	if p.Footprint != nil && (p.Footprint.RawSExpr != "" || p.Footprint.VaultPath != "") {
+		rawFP := p.Footprint.RawSExpr
+		if rawFP == "" && p.Footprint.VaultPath != "" {
+			if b, err := os.ReadFile(p.Footprint.VaultPath); err == nil {
+				rawFP = string(b)
+			}
+		}
+		if rawFP != "" {
+			if d2, err := kicad.ParseFootprintDrawing(rawFP); err == nil {
+				pi.fpPreview.SetDrawing2D(d2)
+			} else {
+				pi.fpPreview.SetEmpty("Could not parse footprint geometry")
+			}
+		} else {
+			pi.fpPreview.SetEmpty("Footprint file not found on disk")
+		}
+	} else {
+		pi.fpPreview.SetEmpty("No footprint attached")
+	}
+
+	// Load 3D model preview asynchronously
+	if len(p.Models3D) > 0 {
+		names := make([]string, 0, len(p.Models3D))
+		for _, m := range p.Models3D {
+			names = append(names, m.FileName)
+		}
+		pi.modelSelect.Options = names
+		if len(names) > 1 {
+			pi.modelSelect.Show()
+		} else {
+			pi.modelSelect.Hide()
+		}
+		pi.modelSelect.Selected = names[0]
+		pi.modelSelect.Refresh()
+		pi.loadSelected3DModel(names[0])
+	} else {
+		pi.modelSelect.Options = nil
+		pi.modelSelect.Hide()
+		pi.m3dPreview.SetEmpty("No 3D models attached")
+	}
+
+	// Warm SVG cache in background via kicad-cli (also fixes .pretty directory handling)
 	partSnapshot := *p
 	go func() {
-		symSVG, fpSVG, _ := pi.mgr.RenderPartPreviews(&partSnapshot)
-		fyne.Do(func() {
-			if pi.part == nil || pi.part.ID != partSnapshot.ID {
-				return
-			}
-			pi.updatePreviewBox(pi.symPreview, symSVG, "No symbol SVG preview")
-			pi.updatePreviewBox(pi.fpPreview, fpSVG, "No footprint SVG preview")
-		})
+		_, _, _ = pi.mgr.RenderPartPreviews(&partSnapshot)
 	}()
 }
 
-func (pi *PartInspector) updatePreviewBox(box *fyne.Container, svgPath, fallback string) {
-	if svgPath == "" {
-		box.Objects = []fyne.CanvasObject{widget.NewLabel(fallback)}
-		box.Refresh()
+func (pi *PartInspector) loadSelected3DModel(fileName string) {
+	if pi.part == nil || len(pi.part.Models3D) == 0 {
+		pi.m3dPreview.SetEmpty("No 3D models attached")
 		return
 	}
-	img := canvas.NewImageFromFile(svgPath)
-	img.FillMode = canvas.ImageFillContain
-	img.SetMinSize(fyne.NewSize(220, 160))
-	box.Objects = []fyne.CanvasObject{img}
-	box.Refresh()
+	var target *db.Model3D
+	for i := range pi.part.Models3D {
+		if pi.part.Models3D[i].FileName == fileName {
+			target = &pi.part.Models3D[i]
+			break
+		}
+	}
+	if target == nil {
+		target = &pi.part.Models3D[0]
+	}
+	if target.VaultPath == "" {
+		pi.m3dPreview.SetEmpty("3D model path not set")
+		return
+	}
+	resolvedPath := kicad.Resolve3DModelPath(target.VaultPath)
+	if _, err := os.Stat(resolvedPath); err != nil {
+		pi.m3dPreview.SetEmpty("3D model file not found on disk:\n" + target.FileName)
+		return
+	}
+
+	partID := pi.part.ID
+	modelPath := resolvedPath
+	modelName := filepath.Base(resolvedPath)
+	pi.m3dPreview.SetEmpty("Loading 3D model " + modelName + "...")
+
+	go func() {
+		mesh, err := kicad.LoadMesh3D(modelPath)
+		fyne.Do(func() {
+			if pi.part == nil || pi.part.ID != partID {
+				return
+			}
+			if err != nil {
+				pi.m3dPreview.SetEmpty(fmt.Sprintf("Could not render %s:\n%v", modelName, err))
+				return
+			}
+			pi.m3dPreview.SetMesh3D(mesh)
+		})
+	}()
 }
 
 func (pi *PartInspector) rebuildMetadataList() {

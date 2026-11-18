@@ -1,13 +1,16 @@
 package ui
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
+	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
 
 	"github.com/jeffk/kicad-lib/internal/config"
 	"github.com/jeffk/kicad-lib/internal/db"
+	"github.com/jeffk/kicad-lib/internal/kicad"
 	"github.com/jeffk/kicad-lib/internal/storage"
 )
 
@@ -79,5 +82,59 @@ func TestPartInspectorHeadless(t *testing.T) {
 	}
 	if updated.Metadata["Power"] != "0.1W" {
 		t.Fatalf("expected Power=0.1W saved to DB, got %+v", updated.Metadata)
+	}
+}
+
+func TestInteractivePreviewWidgetZoomPanAndOrbit(t *testing.T) {
+	a := test.NewApp()
+	defer a.Quit()
+	w := test.NewWindow(nil)
+	defer w.Close()
+
+	fpSExpr := `(footprint "R_0603" (layer "F.Cu") (pad "1" smd roundrect (at -0.8 0) (size 0.9 0.9) (layers "F.Cu" "F.Mask")) (pad "2" smd roundrect (at 0.8 0) (size 0.9 0.9) (layers "F.Cu" "F.Mask")))`
+	d2, err := kicad.ParseFootprintDrawing(fpSExpr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := NewInteractivePreviewWidget(PreviewMode2D, fyne.NewSize(300, 200))
+	pv.Resize(fyne.NewSize(300, 200))
+	pv.SetDrawing2D(d2)
+
+	pv.Scrolled(&fyne.ScrollEvent{Scrolled: fyne.Delta{DY: 1}})
+	pv.Dragged(&fyne.DragEvent{Dragged: fyne.Delta{DX: 15, DY: -10}})
+	if pv.view2D.Zoom <= 1.0 || pv.view2D.PanX != 15 || pv.view2D.PanY != -10 {
+		t.Fatalf("unexpected 2D zoom/pan state: %+v", pv.view2D)
+	}
+	img2D := pv.renderFrame(300, 200)
+	if img2D.Bounds().Dx() != 300 || img2D.Bounds().Dy() != 200 {
+		t.Fatalf("unexpected rendered 2D bounds: %+v", img2D.Bounds())
+	}
+
+	tmp := t.TempDir()
+	wrlPath := filepath.Join(tmp, "box.wrl")
+	if err := os.WriteFile(wrlPath, []byte(`#VRML V2.0 utf8
+Shape { geometry IndexedFaceSet { coord Coordinate { point [ 0 0 0, 2 0 0, 2 2 0, 0 2 0 ] } coordIndex [ 0, 1, 2, 3, -1 ] } }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mesh, err := kicad.LoadMesh3D(wrlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv3 := NewInteractivePreviewWidget(PreviewMode3D, fyne.NewSize(300, 200))
+	pv3.Resize(fyne.NewSize(300, 200))
+	pv3.SetMesh3D(mesh)
+	startYaw := pv3.cam3D.Yaw
+	pv3.Dragged(&fyne.DragEvent{Dragged: fyne.Delta{DX: 20, DY: 10}})
+	if pv3.cam3D.Yaw == startYaw {
+		t.Fatalf("expected 3D orbit yaw to update on drag")
+	}
+	pv3.SetDragMode3D("Pan")
+	pv3.Dragged(&fyne.DragEvent{Dragged: fyne.Delta{DX: 12, DY: -8}})
+	if pv3.cam3D.PanX != 12 || pv3.cam3D.PanY != -8 {
+		t.Fatalf("unexpected 3D pan state: %+v", pv3.cam3D)
+	}
+	pv3.ResetView()
+	if pv3.cam3D.Zoom != 1.0 || pv3.cam3D.PanX != 0 {
+		t.Fatalf("expected reset camera state, got %+v", pv3.cam3D)
 	}
 }
