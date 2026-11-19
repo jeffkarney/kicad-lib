@@ -3,6 +3,7 @@ package kicad
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -327,9 +328,62 @@ func ParseSymbolLibraryFast(data []byte) ([]ParsedSymbol, error) {
 	return out, nil
 }
 
-// ExtractSymbolSExprFromFile reads symLibPath and extracts the standalone `(symbol "<symbolName>" ...)` S-expression.
+// ExtractSymbolSExprFromFile reads symLibPath (which can be a .kicad_sym file or a symbol directory)
+// and extracts the standalone `(symbol "<symbolName>" ...)` S-expression.
 func ExtractSymbolSExprFromFile(symLibPath, symbolName string) (string, error) {
-	data, err := os.ReadFile(symLibPath)
+	info, err := os.Stat(symLibPath)
+	if err != nil {
+		return "", err
+	}
+
+	if info.IsDir() {
+		// First check for direct <symbolName>.kicad_sym match (standard in .kicad_symdir)
+		direct := filepath.Join(symLibPath, symbolName+".kicad_sym")
+		if dInfo, err := os.Stat(direct); err == nil && !dInfo.IsDir() {
+			if s, err := extractSymbolFromSingleFile(direct, symbolName); err == nil {
+				return s, nil
+			}
+		}
+		// Search all .kicad_sym files in the directory
+		entries, err := os.ReadDir(symLibPath)
+		if err != nil {
+			return "", err
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".kicad_sym") {
+				continue
+			}
+			fpath := filepath.Join(symLibPath, e.Name())
+			if s, err := extractSymbolFromSingleFile(fpath, symbolName); err == nil {
+				return s, nil
+			}
+		}
+		return "", fmt.Errorf("symbol %q not found in directory %s", symbolName, symLibPath)
+	}
+
+	// symLibPath is a file
+	s, err := extractSymbolFromSingleFile(symLibPath, symbolName)
+	if err == nil {
+		return s, nil
+	}
+
+	// If not found in the file, check if a sibling file in the same directory contains it
+	// (handles extends references in .kicad_symdir where each symbol has its own file)
+	dir := filepath.Dir(symLibPath)
+	sibling := filepath.Join(dir, symbolName+".kicad_sym")
+	if sibling != symLibPath {
+		if sInfo, sErr := os.Stat(sibling); sErr == nil && !sInfo.IsDir() {
+			if s, err := extractSymbolFromSingleFile(sibling, symbolName); err == nil {
+				return s, nil
+			}
+		}
+	}
+
+	return "", err
+}
+
+func extractSymbolFromSingleFile(filePath, symbolName string) (string, error) {
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
 	}
@@ -342,7 +396,7 @@ func ExtractSymbolSExprFromFile(symLibPath, symbolName string) (string, error) {
 			return s.RawSExpr, nil
 		}
 	}
-	return "", fmt.Errorf("symbol %q not found in %s", symbolName, symLibPath)
+	return "", fmt.Errorf("symbol %q not found in %s", symbolName, filePath)
 }
 
 func readTagFast(data []byte, pos int) (string, int) {

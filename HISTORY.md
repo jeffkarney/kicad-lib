@@ -115,16 +115,29 @@ nix-shell --run "./bin/kicad-lib"
 5. **`.stpZ` and `.wrl` 3D Model Support**:
    - Added ZIP (`PK\x03\x04`) in addition to gzip extraction in `LoadMesh3D` (KiCad `.stpZ` files are ZIP-compressed STEP files).
    - Rewrote `parseVRMLMesh` to scope points/indices/materials per `Shape` (fixing footprints/models where `coordIndex` precedes `point` inside `IndexedFaceSet` and supporting `DEF`/`USE` materials).
-   - Added `Resolve3DModelPath` for sibling extension fallback (when a footprint references `.wrl` but KiCad 10 stores `.stpZ` on disk) and strip triangulation for 360-degree cylindrical/toroidal STEP faces.
 6. **KiCad Project/Schematic/PCB Extraction & Duplicate Compare/Merge**:
    - Added `internal/kicad/project_extract.go` and updated `internal/importer/archive.go` to extract symbols (`.kicad_sch`) and normalized footprints + resolved 3D models (`.kicad_pcb`) when dropping `.kicad_pro`, `.kicad_sch`, `.kicad_pcb`, folders, or zips.
    - Added `db.FindDuplicateParts`, `storage.MergePart` / `MergeOptions`, `ui.ShowDuplicateCompareDialog`, and duplicate notification/resolution workflows in `ui.ShowDropStagingDialog`.
+7. **Library Sync UI Freeze on Final Library Fix**:
+   - *Issue*: During library synchronization, the status bar reported `Syncing KiCad libraries (N/N): <LibraryName>...` on the final library and then froze there permanently when libraries were already up to date (`libsSynced == 0`).
+   - *Fix*: In `internal/ui/app.go` (`syncFromKiCadAsync`), ensured `a.refreshData()` is unconditionally called upon sync completion, refreshing library/part counts and resetting `a.statusLbl` to the active browsing state. In `internal/storage/manager.go` (`SyncFromKiCad`), ensured `onProgress` is invoked for every library index even when a library is skipped or empty. In `internal/ui/app.go`, removed redundant concurrent sync triggers at startup. Added headless regression test `TestSyncFromKiCadStatusReset`.
+8. **Support Directory Symbol Libraries, Component Folders, and Standalone Footprint Libraries in Sync**:
+   - *Issue*: Several user libraries defined in KiCad were missing from `kicad-lib` after sync. Specifically, all directory-based symbol libraries (`.kicad_symdir` directories like `Switch.kicad_symdir`, `Connector_Generic.kicad_symdir`, and component directories like `RP2354`, `LDL212`, `BD33H`, `ESP32-H2-MINI-1U`) were skipped because of `!info.IsDir()` filtering. Standalone footprint libraries in `fp-lib-table` (`Library.pretty`, `Enclosures.pretty`, `PCM_*`) were also skipped because sync only iterated symbol table entries.
+   - *Fix*:
+     - In `internal/storage/manager.go` (`SyncFromKiCad`): Removed `!info.IsDir()` filter from `activeSymEntries`. Implemented `dirMaxMtime` helper to compute directory mtime based on contents. Read all `*.kicad_sym` files in symbol directories and recorded individual `symVaultPaths`. Auto-discovered footprint subfolders (`.pretty`) and `.kicad_mod` files within component directories, and auto-discovered component 3D models (`.step`, `.stp`, `.wrl`).
+     - Added standalone footprint library sync for entries in `fp-lib-table` without matching symbol table entries, parsing all `.kicad_mod` files and their 3D models into SQLite parts.
+     - In `internal/kicad/symbol.go`: Enhanced `ExtractSymbolSExprFromFile` to support directory paths directly and resolve `(extends ...)` references against sibling `.kicad_sym` files within `.kicad_symdir` directories.
+     - In `internal/kicad/footprint.go`: Added `Description` and `Tags` extraction to `ParseFootprintFile`.
+     - In `internal/db/db.go`: Updated `IsLibrarySyncUpToDate` and `BulkSyncLibrary` to check `FPSourceURI` when `SourceURI` is empty, ensuring footprint-only libraries are accurately detected as up-to-date.
+     - In `internal/storage/manager.go`: Protected libraries where `lib.FPSourceURI != ""` from being treated as internal managed libraries.
+     - Added unit tests `TestExtractSymbolSExprFromDirectory`, `TestSyncFromKiCadDirectorySymbolLibraries`, and `TestSyncFromKiCadStandaloneFootprintLibrary`.
 
 ---
 
 ## 5. Key Invariants & Gotchas for Future Changes
 
-- **Never overwrite external KiCad lib tables**: `RegenerateLibrary` / `RegenerateAllLibraries` only writes `sym-lib-table` / `fp-lib-table` when `lib.SourceURI == ""` OR the library contains non-`kicad_sync` parts. Be cautious if merging directly into a stock `kicad_sync` library (`Device`, etc.) — `hasManagedParts` becomes true if any part in that library stops being `kicad_sync`.
+- **Never overwrite external KiCad lib tables**: `RegenerateLibrary` / `RegenerateAllLibraries` only writes `sym-lib-table` / `fp-lib-table` when `lib.SourceURI == "" && lib.FPSourceURI == ""` OR the library contains non-`kicad_sync` parts. Be cautious if merging directly into a stock `kicad_sync` library (`Device`, etc.) — `hasManagedParts` becomes true if any part in that library stops being `kicad_sync`.
 - **SQLite single connection (`SetMaxOpenConns(1)`) & FTS5 cleanup**: Because `parts_fts` is an FTS5 table without foreign-key triggers, `DeleteLibrary`, `DeletePart`, `BulkSyncLibrary`, and `SavePart` must keep `parts_fts` synchronized manually inside the transaction.
 - **3D model paths & KiCad 10**: Always normalize/probe via `kicad.Resolve3DModelPath` and expand variables via `kicad.ExpandKiCadURI`. Do not shell out to `kicad-cli pcb render`.
 - **Tests run in `nix-shell`**: Headless Fyne UI tests use `fyne.io/fyne/v2/test`; all packages (`internal/db`, `internal/importer`, `internal/kicad`, `internal/storage`, `internal/ui`) pass cleanly under `nix-shell --run "go test -v ./..."`.
+

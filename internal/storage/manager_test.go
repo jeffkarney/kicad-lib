@@ -2,6 +2,7 @@ package storage
 
 import (
 	"archive/zip"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -472,3 +473,264 @@ func TestDuplicateDetectionAndMergePart(t *testing.T) {
 		t.Fatalf("expected renamed copy STM32F405RGT6_2, got id=%d name=%q", renamed.ID, renamed.Name)
 	}
 }
+
+func TestSyncFromKiCadDirectorySymbolLibraries(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad-cfg"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Create a .kicad_symdir directory library
+	symDir := filepath.Join(tmp, "Custom_Switches.kicad_symdir")
+	if err := os.MkdirAll(symDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sym1 := `(kicad_symbol_lib (version 20231120) (generator "kicad_symbol_editor")
+		(symbol "SW_1" (property "Reference" "SW" (at 0 0 0)) (property "Value" "SW_1" (at 0 2 0)))
+	)`
+	sym2 := `(kicad_symbol_lib (version 20231120) (generator "kicad_symbol_editor")
+		(symbol "SW_2" (property "Reference" "SW" (at 0 0 0)) (property "Value" "SW_2" (at 0 2 0)))
+	)`
+	if err := os.WriteFile(filepath.Join(symDir, "SW_1.kicad_sym"), []byte(sym1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(symDir, "SW_2.kicad_sym"), []byte(sym2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Create a component directory library with .kicad_sym, footprints.pretty, and .step
+	cmpDir := filepath.Join(tmp, "ESP32_Module")
+	cmpFPDir := filepath.Join(cmpDir, "footprints.pretty")
+	if err := os.MkdirAll(cmpFPDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmpSym := `(kicad_symbol_lib (version 20231120) (generator "kicad_symbol_editor")
+		(symbol "ESP32_DEV"
+			(property "Reference" "U" (at 0 0 0))
+			(property "Value" "ESP32_DEV" (at 0 2 0))
+			(property "Footprint" "ESP32_DEV_FP" (at 0 -2 0))
+		)
+	)`
+	cmpFP := `(footprint "ESP32_DEV_FP" (layer "F.Cu") (descr "ESP32 Dev Module")
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+	)`
+	if err := os.WriteFile(filepath.Join(cmpDir, "ESP32_DEV.kicad_sym"), []byte(cmpSym), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmpFPDir, "ESP32_DEV_FP.kicad_mod"), []byte(cmpFP), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmpDir, "ESP32_DEV.step"), []byte("ISO-10303-21;\nEND-ISO-10303-21;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	symTable := fmt.Sprintf(`(sym_lib_table
+	(version 7)
+	(lib (name "Custom_Switches") (type "KiCad") (uri "%s") (options "") (descr "Switches symdir"))
+	(lib (name "ESP32_Module") (type "KiCad") (uri "%s") (options "") (descr "ESP32 component dir"))
+)
+`, symDir, cmpDir)
+	if err := os.MkdirAll(cfg.KiCadConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.KiCadConfigDir, "sym-lib-table"), []byte(symTable), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	libsSynced, partsSynced, err := mgr.SyncFromKiCad(nil)
+	if err != nil {
+		t.Fatalf("SyncFromKiCad failed: %v", err)
+	}
+	if libsSynced != 2 {
+		t.Fatalf("expected 2 libraries synced, got %d", libsSynced)
+	}
+	if partsSynced != 3 {
+		t.Fatalf("expected 3 parts synced (2 switches, 1 esp32), got %d", partsSynced)
+	}
+
+	swLib, err := database.GetLibraryByName("Custom_Switches")
+	if err != nil {
+		t.Fatalf("GetLibraryByName(Custom_Switches) failed: %v", err)
+	}
+	swParts, err := database.ListPartsByLibrary(swLib.ID)
+	if err != nil || len(swParts) != 2 {
+		t.Fatalf("expected 2 switch parts, got %d (err: %v)", len(swParts), err)
+	}
+	for _, p := range swParts {
+		if p.Symbol == nil || !strings.HasSuffix(p.Symbol.VaultPath, ".kicad_sym") {
+			t.Fatalf("expected part symbol vault path to be .kicad_sym file, got %+v", p.Symbol)
+		}
+	}
+
+	espLib, err := database.GetLibraryByName("ESP32_Module")
+	if err != nil {
+		t.Fatalf("GetLibraryByName(ESP32_Module) failed: %v", err)
+	}
+	espParts, err := database.ListPartsByLibrary(espLib.ID)
+	if err != nil || len(espParts) != 1 {
+		t.Fatalf("expected 1 ESP32 part, got %d (err: %v)", len(espParts), err)
+	}
+	p := espParts[0]
+	if p.Footprint == nil || p.Footprint.Name != "ESP32_DEV_FP" {
+		t.Fatalf("expected auto-discovered footprint ESP32_DEV_FP, got %+v", p.Footprint)
+	}
+	if len(p.Models3D) != 1 || p.Models3D[0].FileName != "ESP32_DEV.step" {
+		t.Fatalf("expected auto-discovered 3D model ESP32_DEV.step, got %+v", p.Models3D)
+	}
+}
+
+func TestSyncFromKiCadStandaloneFootprintLibrary(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad-cfg"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fpDir := filepath.Join(tmp, "Custom_Footprints.pretty")
+	if err := os.MkdirAll(fpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fp1 := `(footprint "SOT-23-6_Custom" (layer "F.Cu") (descr "6-pin SOT23") (tags "sot23 smd")
+		(pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu"))
+		(pad "2" smd rect (at 1 0) (size 0.5 0.5) (layers "F.Cu"))
+	)`
+	if err := os.WriteFile(filepath.Join(fpDir, "SOT-23-6_Custom.kicad_mod"), []byte(fp1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fpTable := fmt.Sprintf(`(fp_lib_table
+	(version 7)
+	(lib (name "Custom_Footprints") (type "KiCad") (uri "%s") (options "") (descr "Standalone footprints"))
+)
+`, fpDir)
+	if err := os.MkdirAll(cfg.KiCadConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.KiCadConfigDir, "fp-lib-table"), []byte(fpTable), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	libsSynced, partsSynced, err := mgr.SyncFromKiCad(nil)
+	if err != nil {
+		t.Fatalf("SyncFromKiCad failed: %v", err)
+	}
+	if libsSynced != 1 {
+		t.Fatalf("expected 1 library synced, got %d", libsSynced)
+	}
+	if partsSynced != 1 {
+		t.Fatalf("expected 1 part synced, got %d", partsSynced)
+	}
+
+	lib, err := database.GetLibraryByName("Custom_Footprints")
+	if err != nil {
+		t.Fatalf("GetLibraryByName(Custom_Footprints) failed: %v", err)
+	}
+	if lib.FPSourceURI != fpDir {
+		t.Fatalf("expected FPSourceURI=%q, got %q", fpDir, lib.FPSourceURI)
+	}
+
+	parts, err := database.ListPartsByLibrary(lib.ID)
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d (err: %v)", len(parts), err)
+	}
+	pt := parts[0]
+	if pt.Name != "SOT-23-6_Custom" || pt.Footprint == nil || pt.Footprint.PadCount != 2 {
+		t.Fatalf("unexpected footprint part: %+v", pt)
+	}
+	if pt.Description != "6-pin SOT23" {
+		t.Fatalf("expected description '6-pin SOT23', got %q", pt.Description)
+	}
+
+	libs2, parts2, err := mgr.SyncFromKiCad(nil)
+	if err != nil {
+		t.Fatalf("second SyncFromKiCad failed: %v", err)
+	}
+	if libs2 != 0 || parts2 != 0 {
+		t.Fatalf("expected 0 synced on second run, got libs=%d parts=%d", libs2, parts2)
+	}
+}
+
+func TestLiveKiCadSync(t *testing.T) {
+	cfg, err := config.Load()
+	if err != nil {
+		t.Skip("skipping live sync test: no config")
+	}
+	if _, err := os.Stat(cfg.KiCadConfigDir); err != nil {
+		t.Skip("skipping live sync test: kicad config dir missing")
+	}
+
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	libsSynced, partsSynced, err := mgr.SyncFromKiCad(func(p SyncProgress) {
+		t.Logf("[%d/%d] (%s) parts synced so far: %d", p.Current, p.Total, p.LibraryName, p.PartsSynced)
+	})
+	if err != nil {
+		t.Fatalf("live SyncFromKiCad failed: %v", err)
+	}
+	t.Logf("Live sync completed: %d libs synced, %d parts synced", libsSynced, partsSynced)
+
+	// Check specifically that the previously missing libraries are now present
+	expectedLibs := []string{
+		"git-switch",
+		"git-connector-generic",
+		"RP2354",
+		"LDL212",
+		"BD33H 3.3V reg",
+		"ESP32-H2-MINI-1U-H2S",
+		"esp32-mini-1u",
+		"KiCad Symbols - Git",
+		"Regulator 3.3v NCV8187AMT330TAG",
+		"Library",
+		"Enclosure PCBs",
+	}
+	for _, name := range expectedLibs {
+		lib, err := database.GetLibraryByName(name)
+		if err != nil {
+			t.Errorf("expected library %q to be in database after sync, err=%v", name, err)
+			continue
+		}
+		parts, _ := database.ListPartsByLibrary(lib.ID)
+		t.Logf("Verified library in DB: %s (id: %d, parts: %d, source: %s, fp: %s)",
+			lib.Name, lib.ID, len(parts), filepath.Base(lib.SourceURI), filepath.Base(lib.FPSourceURI))
+	}
+}
+
+

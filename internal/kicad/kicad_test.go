@@ -454,3 +454,73 @@ Shape { geometry IndexedFaceSet
 		}
 	}
 }
+
+func TestExtractSymbolSExprFromDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	symDir := filepath.Join(tmp, "Test_Dir.kicad_symdir")
+	if err := os.MkdirAll(symDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	parentSym := `(kicad_symbol_lib
+	(version 20231120)
+	(generator "kicad_symbol_editor")
+	(symbol "SW_Parent"
+		(pin passive line (at 0 0 0) (length 2.54) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+	)
+)
+`
+	childSym := `(kicad_symbol_lib
+	(version 20231120)
+	(generator "kicad_symbol_editor")
+	(symbol "SW_Child"
+		(extends "SW_Parent")
+		(property "Reference" "SW" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "SW_Child" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+	)
+)
+`
+	if err := os.WriteFile(filepath.Join(symDir, "SW_Parent.kicad_sym"), []byte(parentSym), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(symDir, "SW_Child.kicad_sym"), []byte(childSym), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rawChild, err := ExtractSymbolSExprFromFile(symDir, "SW_Child")
+	if err != nil {
+		t.Fatalf("ExtractSymbolSExprFromFile(dir, SW_Child) failed: %v", err)
+	}
+	if !strings.Contains(rawChild, `(symbol "SW_Child"`) {
+		t.Fatalf("unexpected rawChild: %s", rawChild)
+	}
+
+	rawParent, err := ExtractSymbolSExprFromFile(symDir, "SW_Parent")
+	if err != nil {
+		t.Fatalf("ExtractSymbolSExprFromFile(dir, SW_Parent) failed: %v", err)
+	}
+	if !strings.Contains(rawParent, `(symbol "SW_Parent"`) {
+		t.Fatalf("unexpected rawParent: %s", rawParent)
+	}
+
+	d, err := ParseSymbolDrawingFromFile(symDir, "SW_Child")
+	if err != nil {
+		t.Fatalf("ParseSymbolDrawingFromFile(dir, SW_Child) failed: %v", err)
+	}
+	if d.Name != "SW_Child" {
+		t.Fatalf("expected drawing name SW_Child, got %s", d.Name)
+	}
+	if len(d.Pins) != 1 {
+		t.Fatalf("expected 1 inherited pin, got %d", len(d.Pins))
+	}
+
+	childFile := filepath.Join(symDir, "SW_Child.kicad_sym")
+	dFile, err := ParseSymbolDrawingFromFile(childFile, "SW_Child")
+	if err != nil {
+		t.Fatalf("ParseSymbolDrawingFromFile(childFile, SW_Child) failed: %v", err)
+	}
+	if len(dFile.Pins) != 1 {
+		t.Fatalf("expected 1 inherited pin from childFile, got %d", len(dFile.Pins))
+	}
+}
+

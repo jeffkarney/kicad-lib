@@ -273,7 +273,8 @@ func (d *DB) IsLibrarySyncUpToDate(name, sourceURI string, sourceMtime int64) (b
 		}
 		return false, err
 	}
-	return lib.SourceURI == sourceURI && lib.SourceMtime == sourceMtime, nil
+	matchesURI := lib.SourceURI == sourceURI || (sourceURI != "" && lib.SourceURI == "" && lib.FPSourceURI == sourceURI)
+	return matchesURI && lib.SourceMtime == sourceMtime, nil
 }
 
 // BulkSyncLibrary syncs an external KiCad library into SQLite in a single transaction,
@@ -285,7 +286,8 @@ func (d *DB) BulkSyncLibrary(name, description, sourceURI, fpSourceURI string, s
 	}
 
 	if existing, err := d.GetLibraryByName(name); err == nil {
-		if existing.SourceURI == sourceURI && existing.SourceMtime == sourceMtime && sourceMtime > 0 {
+		matchesURI := (existing.SourceURI == sourceURI) || (sourceURI == "" && existing.FPSourceURI == fpSourceURI)
+		if matchesURI && existing.SourceMtime == sourceMtime && sourceMtime > 0 {
 			return existing, false, nil
 		}
 	}

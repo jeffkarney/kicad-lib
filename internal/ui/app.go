@@ -26,10 +26,11 @@ type App struct {
 	win     fyne.Window
 	mgr     *storage.Manager
 
-	libraries       []db.Library
-	selectedLibID   int64 // 0 = All Parts
-	parts           []db.Part
-	wasIPCConnected bool
+	libraries          []db.Library
+	selectedLibID      int64 // 0 = All Parts
+	parts              []db.Part
+	wasIPCConnected    bool
+	wasInitialSyncDone bool
 
 	libList      *widget.List
 	partsList    *widget.List
@@ -56,7 +57,6 @@ func NewApp(mgr *storage.Manager) *App {
 	a.buildUI()
 	a.refreshData()
 	a.checkIPCAsync()
-	a.syncFromKiCadAsync(false)
 	return a
 }
 
@@ -498,6 +498,10 @@ func (a *App) handleExportSelectedLibrary() {
 func (a *App) checkIPCAsync() {
 	ipc := a.mgr.IPC()
 	if ipc == nil {
+		if !a.wasInitialSyncDone {
+			a.wasInitialSyncDone = true
+			a.syncFromKiCadAsync(false)
+		}
 		return
 	}
 	go func() {
@@ -517,13 +521,18 @@ func (a *App) applyIPCStatus(st kicad.IPCStatus) {
 		} else {
 			a.ipcStatusLbl.SetText(fmt.Sprintf("KiCad IPC: %s", st.KiCadVersion))
 		}
-		if justConnected {
+		if justConnected || !a.wasInitialSyncDone {
+			a.wasInitialSyncDone = true
 			a.syncFromKiCadAsync(false)
 		}
 		return
 	}
 	a.wasIPCConnected = false
 	a.ipcStatusLbl.SetText("KiCad IPC: Offline (File Sync Active)")
+	if !a.wasInitialSyncDone {
+		a.wasInitialSyncDone = true
+		a.syncFromKiCadAsync(false)
+	}
 }
 
 func (a *App) syncFromKiCadAsync(showSummary bool) {
@@ -546,9 +555,7 @@ func (a *App) syncFromKiCadAsync(showSummary bool) {
 				}
 				return
 			}
-			if libsSynced > 0 {
-				a.refreshData()
-			}
+			a.refreshData()
 			if showSummary {
 				if libsSynced > 0 {
 					dialog.ShowInformation("KiCad Libraries Synced",

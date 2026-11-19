@@ -3,7 +3,9 @@ package ui
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
@@ -193,4 +195,92 @@ func TestDuplicateCompareDialogHeadless(t *testing.T) {
 		Candidates: []importer.CandidatePart{*cand},
 	}
 	ShowDropStagingDialog(w, mgr, scanRes, nil)
+}
+
+func TestSyncFromKiCadStatusReset(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cfg.KiCadConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	symDir := filepath.Join(tmp, "ext_syms")
+	if err := os.MkdirAll(symDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symFile := filepath.Join(symDir, "Passive.kicad_sym")
+	symContent := `(kicad_symbol_lib (version 20231120) (generator "test")
+	(symbol "R_0603" (in_bom yes) (on_board yes)
+		(property "Reference" "R" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "10k" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "R_0603_1_1"
+			(pin passive line (at -5.08 0 0) (length 2.54) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+		)
+	)
+)`
+	if err := os.WriteFile(symFile, []byte(symContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tableContent := `(sym_lib_table (version 7)
+	(lib (name "Passive") (type "KiCad") (uri "` + symFile + `") (options "") (descr ""))
+)`
+	if err := os.WriteFile(filepath.Join(cfg.KiCadConfigDir, "sym-lib-table"), []byte(tableContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := storage.NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Initial sync puts Passive library into the database
+	if _, _, err := mgr.SyncFromKiCad(nil); err != nil {
+		t.Fatalf("initial SyncFromKiCad failed: %v", err)
+	}
+
+	a := test.NewApp()
+	defer a.Quit()
+	w := test.NewWindow(nil)
+	defer w.Close()
+
+	appInstance := &App{
+		fyneApp: a,
+		win:     w,
+		mgr:     mgr,
+	}
+	appInstance.buildUI()
+	appInstance.refreshData()
+
+	// 2. Run syncFromKiCadAsync when libraries are already up to date (libsSynced == 0)
+	appInstance.syncFromKiCadAsync(false)
+
+	// Wait up to 3 seconds for async sync & fyne.Do to complete
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		text := appInstance.statusLbl.Text
+		if !strings.HasPrefix(text, "Syncing KiCad libraries") {
+			break
+		}
+	}
+
+	finalStatus := appInstance.statusLbl.Text
+	if strings.HasPrefix(finalStatus, "Syncing KiCad libraries") {
+		t.Fatalf("expected status label to reset after sync, but still showing: %q", finalStatus)
+	}
+	if !strings.Contains(finalStatus, "part(s) across") && !strings.Contains(finalStatus, "part(s)") {
+		t.Fatalf("expected status label to reflect part/library counts, got: %q", finalStatus)
+	}
 }

@@ -22,10 +22,12 @@ type ParsedModel3D struct {
 
 // ParsedFootprint holds metadata and raw S-expression of a `.kicad_mod` file.
 type ParsedFootprint struct {
-	Name     string
-	PadCount int
-	Models   []ParsedModel3D
-	RawSExpr string
+	Name        string
+	Description string
+	Tags        string
+	PadCount    int
+	Models      []ParsedModel3D
+	RawSExpr    string
 }
 
 // ParseFootprintFile parses a `.kicad_mod` file (either `(footprint ...)` or legacy `(module ...)`).
@@ -43,6 +45,12 @@ func ParseFootprintFile(data []byte) (*ParsedFootprint, error) {
 		Name:     node.Arg(1),
 		PadCount: len(node.FindChildren("pad")),
 		RawSExpr: node.PrettyString(0),
+	}
+	if descr := node.FindChild("descr"); descr != nil {
+		pf.Description = descr.Arg(1)
+	}
+	if tags := node.FindChild("tags"); tags != nil {
+		pf.Tags = tags.Arg(1)
 	}
 
 	for _, mn := range node.FindChildren("model") {
