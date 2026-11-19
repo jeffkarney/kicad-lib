@@ -37,6 +37,37 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		return
 	}
 
+	stageWin := fyne.CurrentApp().NewWindow("Stage & Import Parts")
+	defaultWidth := float32(1280)
+	defaultHeight := float32(840)
+	if parent != nil {
+		pSize := parent.Canvas().Size()
+		if pSize.Width > 0 && pSize.Height > 0 {
+			targetW := pSize.Width * 0.85
+			targetH := pSize.Height * 0.85
+			if targetW > defaultWidth {
+				defaultWidth = targetW
+			}
+			if targetH > defaultHeight {
+				defaultHeight = targetH
+			}
+		}
+	}
+	if defaultWidth > 1600 {
+		defaultWidth = 1600
+	}
+	if defaultHeight > 1050 {
+		defaultHeight = 1050
+	}
+	stageWin.Resize(fyne.NewSize(defaultWidth, defaultHeight))
+	stageWin.SetFixedSize(false)
+
+	stageWin.Canvas().SetOnTypedKey(func(ev *fyne.KeyEvent) {
+		if ev.Name == fyne.KeyEscape {
+			stageWin.Close()
+		}
+	})
+
 	libs, _ := mgr.DB().ListLibraries()
 	libNames := make([]string, 0, len(libs))
 	libIDByName := make(map[string]int64, len(libs))
@@ -248,7 +279,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			return
 		}
 		ShowDuplicateCompareDialog(
-			parent, mgr, currentTargetLibID(),
+			stageWin, mgr, currentTargetLibID(),
 			&res.Candidates[idx], resolutions[idx].AllMatches, resolutions[idx].Options,
 			func(selectedMatch db.Part, opts storage.MergeOptions) {
 				resolutions[idx].DuplicatePart = &selectedMatch
@@ -450,7 +481,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			found, err := importer.LookupMetadata(ctx, mgr.Config(), query)
 			fyne.Do(func() {
 				if err != nil {
-					dialog.ShowError(err, parent)
+					dialog.ShowError(err, stageWin)
 					return
 				}
 				target := &res.Candidates[idx]
@@ -592,7 +623,6 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		newLibBox,
 	))
 
-	var dlg dialog.Dialog
 	executeImport := func(targetLib *db.Library) {
 		var errs []string
 		importedCount := 0
@@ -657,7 +687,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			}
 		}
 
-		dlg.Hide()
+		stageWin.Close()
 		summary := fmt.Sprintf("Library %q updated: %d imported, %d merged, %d skipped.", targetLib.Name, importedCount, mergedCount, skippedCount)
 		if len(errs) > 0 {
 			dialog.ShowInformation("Import Completed with Warnings",
@@ -681,7 +711,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 			}
 		}
 		if selectedCount == 0 {
-			dialog.ShowInformation("No Parts Selected", "Check at least one part to import.", parent)
+			dialog.ShowInformation("No Parts Selected", "Check at least one part to import.", stageWin)
 			return
 		}
 
@@ -690,26 +720,26 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		if targetModeRadio.Selected == modeNew {
 			libName := strings.TrimSpace(newLibNameEntry.Text)
 			if libName == "" {
-				dialog.ShowInformation("Library Name Required", "Enter a name for the new KiCad library.", parent)
+				dialog.ShowInformation("Library Name Required", "Enter a name for the new KiCad library.", stageWin)
 				return
 			}
 			targetLib, err = mgr.DB().GetLibraryByName(libName)
 			if err != nil {
 				targetLib, err = mgr.DB().CreateLibrary(libName, strings.TrimSpace(newLibDescEntry.Text))
 				if err != nil {
-					dialog.ShowError(err, parent)
+					dialog.ShowError(err, stageWin)
 					return
 				}
 			}
 		} else {
 			libName := existingSelect.Selected
 			if libName == "" {
-				dialog.ShowInformation("Library Required", "Select an existing library or choose Create New Library.", parent)
+				dialog.ShowInformation("Library Required", "Select an existing library or choose Create New Library.", stageWin)
 				return
 			}
 			targetLib, err = mgr.DB().GetLibraryByName(libName)
 			if err != nil {
-				dialog.ShowError(err, parent)
+				dialog.ShowError(err, stageWin)
 				return
 			}
 		}
@@ -746,7 +776,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	importBtn.Importance = widget.HighImportance
 
 	cancelBtn := widget.NewButton("Cancel", func() {
-		dlg.Hide()
+		stageWin.Close()
 	})
 
 	body := container.NewBorder(
@@ -756,10 +786,10 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		split,
 	)
 
-	dlg = dialog.NewCustomWithoutButtons("Stage & Import Parts", body, parent)
-	dlg.SetOnClosed(func() {
+	stageWin.SetContent(body)
+	stageWin.SetOnClosed(func() {
 		res.Cleanup()
 	})
-	dlg.Resize(fyne.NewSize(960, 680))
-	dlg.Show()
+	stageWin.CenterOnScreen()
+	stageWin.Show()
 }

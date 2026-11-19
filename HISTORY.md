@@ -132,6 +132,15 @@ nix-shell --run "./bin/kicad-lib"
      - In `internal/storage/manager.go`: Protected libraries where `lib.FPSourceURI != ""` from being treated as internal managed libraries.
      - Added unit tests `TestExtractSymbolSExprFromDirectory`, `TestSyncFromKiCadDirectorySymbolLibraries`, and `TestSyncFromKiCadStandaloneFootprintLibrary`.
 
+9. **Resizable & Responsive Import Staging Window**:
+   - *Issue*: The "Stage & Import Parts" staging interface was rendered as a fixed-size `dialog.NewCustom` modal (960x680) centered in the canvas. On high-resolution displays, it was cramped, required excessive scrolling, and could not be resized or maximized by the user.
+   - *Fix*:
+     - In `internal/ui/drop_dialog.go` (`ShowDropStagingDialog`): Migrated from an in-canvas `dialog.Dialog` to a native OS `fyne.Window` (`stageWin`).
+     - Set initial dimensions to dynamically scale with the parent window (up to 85% of parent width/height, default 1280x840, clamped to 1600x1050), giving generous space for candidate lists, metadata fields, and duplicate notifications.
+     - Enabled standard OS resizing (`SetFixedSize(false)`) so users can freely drag borders, corners, or maximize to full screen.
+     - Added `Escape` key shortcut to quickly dismiss/cancel the staging window.
+     - Wired `ShowDuplicateCompareDialog` to use `stageWin` as its parent and increased its default dimensions responsively (up to 90% of `stageWin`, default 1100x750) for easier side-by-side comparison of 2D/3D models and metadata.
+
 ---
 
 ## 5. Key Invariants & Gotchas for Future Changes
@@ -140,4 +149,5 @@ nix-shell --run "./bin/kicad-lib"
 - **SQLite single connection (`SetMaxOpenConns(1)`) & FTS5 cleanup**: Because `parts_fts` is an FTS5 table without foreign-key triggers, `DeleteLibrary`, `DeletePart`, `BulkSyncLibrary`, and `SavePart` must keep `parts_fts` synchronized manually inside the transaction.
 - **3D model paths & KiCad 10**: Always normalize/probe via `kicad.Resolve3DModelPath` and expand variables via `kicad.ExpandKiCadURI`. Do not shell out to `kicad-cli pcb render`.
 - **Tests run in `nix-shell`**: Headless Fyne UI tests use `fyne.io/fyne/v2/test`; all packages (`internal/db`, `internal/importer`, `internal/kicad`, `internal/storage`, `internal/ui`) pass cleanly under `nix-shell --run "go test -v ./..."`.
+
 

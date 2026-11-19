@@ -386,7 +386,27 @@ func ShowDuplicateCompareDialog(
 	)
 
 	dlg = dialog.NewCustomWithoutButtons("Compare & Merge Duplicate Part", content, parent)
-	dlg.Resize(fyne.NewSize(960, 700))
+	dlgSize := fyne.NewSize(1100, 750)
+	if parent != nil {
+		pSize := parent.Canvas().Size()
+		if pSize.Width > 0 && pSize.Height > 0 {
+			targetW := pSize.Width * 0.90
+			targetH := pSize.Height * 0.90
+			if targetW > dlgSize.Width {
+				dlgSize.Width = targetW
+			}
+			if targetH > dlgSize.Height {
+				dlgSize.Height = targetH
+			}
+		}
+	}
+	if dlgSize.Width > 1500 {
+		dlgSize.Width = 1500
+	}
+	if dlgSize.Height > 950 {
+		dlgSize.Height = 950
+	}
+	dlg.Resize(dlgSize)
 	dlg.Show()
 }
 
