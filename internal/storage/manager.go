@@ -815,23 +815,139 @@ func (m *Manager) RegenerateLibrary(libraryID int64) error {
 		return fmt.Errorf("write symbol library %q: %w", symFilePath, err)
 	}
 
-	hasManagedParts := (lib.SourceURI == "" && lib.FPSourceURI == "")
-	for _, p := range parts {
-		if p.SourceType != "kicad_sync" {
-			hasManagedParts = true
-			break
-		}
-	}
+	hasManagedParts := libraryHasManagedParts(lib, parts)
 
 	if m.cfg.AutoRegisterLibTables && m.cfg.KiCadConfigDir != "" && hasManagedParts {
-		if err := kicad.RegisterSymbolLibrary(m.cfg.KiCadConfigDir, lib.Name, symFilePath, lib.Description); err != nil {
-			return fmt.Errorf("register sym-lib-table: %w", err)
-		}
-		if err := kicad.RegisterFootprintLibrary(m.cfg.KiCadConfigDir, lib.Name, prettyDir, lib.Description); err != nil {
-			return fmt.Errorf("register fp-lib-table: %w", err)
+		if lib.KiCadEnabled {
+			if err := kicad.RegisterSymbolLibrary(m.cfg.KiCadConfigDir, lib.Name, symFilePath, lib.Description); err != nil {
+				return fmt.Errorf("register sym-lib-table: %w", err)
+			}
+			if err := kicad.RegisterFootprintLibrary(m.cfg.KiCadConfigDir, lib.Name, prettyDir, lib.Description); err != nil {
+				return fmt.Errorf("register fp-lib-table: %w", err)
+			}
+		} else {
+			if err := kicad.SetSymbolLibraryEnabled(m.cfg.KiCadConfigDir, lib.Name, symFilePath, lib.Description, false); err != nil {
+				return fmt.Errorf("disable sym-lib-table: %w", err)
+			}
+			if err := kicad.SetFootprintLibraryEnabled(m.cfg.KiCadConfigDir, lib.Name, prettyDir, lib.Description, false); err != nil {
+				return fmt.Errorf("disable fp-lib-table: %w", err)
+			}
 		}
 	}
 
+	return nil
+}
+
+func libraryHasManagedParts(lib *db.Library, parts []db.Part) bool {
+	if lib != nil && lib.SourceURI == "" && lib.FPSourceURI == "" {
+		return true
+	}
+	for _, p := range parts {
+		if p.SourceType != "kicad_sync" {
+			return true
+		}
+	}
+	return false
+}
+
+// SetLibraryKiCadEnabled enables or disables a library in KiCad by updating SQLite,
+// toggling `(disabled)` in sym-lib-table / fp-lib-table, and notifying KiCad IPC.
+func (m *Manager) SetLibraryKiCadEnabled(libraryID int64, enabled bool) error {
+	return m.SetLibrariesKiCadEnabled([]int64{libraryID}, enabled)
+}
+
+// SetLibrariesKiCadEnabled enables or disables one or more libraries in KiCad,
+// updating SQLite in one transaction, updating sym-lib-table / fp-lib-table in a single batch write,
+// and notifying KiCad IPC once.
+func (m *Manager) SetLibrariesKiCadEnabled(libraryIDs []int64, enabled bool) error {
+	if len(libraryIDs) == 0 {
+		return nil
+	}
+
+	allLibs, err := m.db.ListLibraries()
+	if err != nil {
+		return err
+	}
+	libByID := make(map[int64]db.Library, len(allLibs))
+	for _, l := range allLibs {
+		libByID[l.ID] = l
+	}
+
+	libs := make([]db.Library, 0, len(libraryIDs))
+	validIDs := make([]int64, 0, len(libraryIDs))
+	seen := make(map[int64]bool, len(libraryIDs))
+	for _, id := range libraryIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		lib, ok := libByID[id]
+		if !ok {
+			return fmt.Errorf("lookup library %d: not found", id)
+		}
+		libs = append(libs, lib)
+		validIDs = append(validIDs, id)
+	}
+
+	if err := m.db.SetLibrariesKiCadEnabled(validIDs, enabled); err != nil {
+		return err
+	}
+
+	if m.cfg.KiCadConfigDir != "" {
+		managedPartLibs, err := m.db.ListLibraryIDsWithManagedParts()
+		if err != nil {
+			return err
+		}
+
+		symUpdates := make([]kicad.LibTableToggle, 0, len(libs))
+		fpUpdates := make([]kicad.LibTableToggle, 0, len(libs))
+		for _, lib := range libs {
+			isManaged := (lib.SourceURI == "" && lib.FPSourceURI == "") || managedPartLibs[lib.ID]
+			if isManaged {
+				symFilePath := filepath.Join(m.cfg.SymbolsDir(), lib.Name+".kicad_sym")
+				prettyDir := filepath.Join(m.cfg.FootprintsDir(), lib.Name+".pretty")
+				if enabled {
+					if _, statErr := os.Stat(symFilePath); statErr != nil {
+						_ = m.RegenerateLibrary(lib.ID)
+					}
+				}
+				symUpdates = append(symUpdates, kicad.LibTableToggle{
+					Name:        lib.Name,
+					URI:         symFilePath,
+					Description: lib.Description,
+					Enabled:     enabled,
+				})
+				fpUpdates = append(fpUpdates, kicad.LibTableToggle{
+					Name:        lib.Name,
+					URI:         prettyDir,
+					Description: lib.Description,
+					Enabled:     enabled,
+				})
+			} else {
+				symUpdates = append(symUpdates, kicad.LibTableToggle{
+					Name:        lib.Name,
+					URI:         lib.SourceURI,
+					Description: lib.Description,
+					Enabled:     enabled,
+				})
+				fpUpdates = append(fpUpdates, kicad.LibTableToggle{
+					Name:        lib.Name,
+					URI:         lib.FPSourceURI,
+					Description: lib.Description,
+					Enabled:     enabled,
+				})
+			}
+		}
+
+		if err := kicad.SetSymbolLibrariesEnabled(m.cfg.KiCadConfigDir, symUpdates); err != nil {
+			return fmt.Errorf("batch update sym-lib-table: %w", err)
+		}
+		if err := kicad.SetFootprintLibrariesEnabled(m.cfg.KiCadConfigDir, fpUpdates); err != nil {
+			return fmt.Errorf("batch update fp-lib-table: %w", err)
+		}
+	}
+
+	m.notifyIPC()
 	return nil
 }
 
@@ -841,23 +957,15 @@ func (m *Manager) RegenerateAllLibraries() error {
 	if err != nil {
 		return err
 	}
-	for _, lib := range libs {
-		if lib.SourceURI != "" || lib.FPSourceURI != "" {
+	managedPartLibs, err := m.db.ListLibraryIDsWithManagedParts()
+	if err != nil {
+		return err
+	}
+	for i := range libs {
+		lib := &libs[i]
+		if (lib.SourceURI != "" || lib.FPSourceURI != "") && !managedPartLibs[lib.ID] {
 			// Skip untouched external synced KiCad libraries unless they contain user-managed parts
-			parts, perr := m.db.ListPartsByLibrary(lib.ID)
-			if perr != nil {
-				return perr
-			}
-			hasManaged := false
-			for _, p := range parts {
-				if p.SourceType != "kicad_sync" {
-					hasManaged = true
-					break
-				}
-			}
-			if !hasManaged {
-				continue
-			}
+			continue
 		}
 		if err := m.RegenerateLibrary(lib.ID); err != nil {
 			return err

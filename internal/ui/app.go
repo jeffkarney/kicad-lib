@@ -26,14 +26,18 @@ type App struct {
 	win     fyne.Window
 	mgr     *storage.Manager
 
+	allLibraries       []db.Library
+	visibleLibraries   []db.Library
 	libraries          []db.Library
 	selectedLibID      int64 // 0 = All Parts
 	parts              []db.Part
 	wasIPCConnected    bool
 	wasInitialSyncDone bool
 
-	libList      *widget.List
-	partsList    *widget.List
+	libList        *widget.List
+	libSearchEntry *widget.Entry
+	toggleKiCadBtn *widget.Button
+	partsList      *widget.List
 	searchEntry  *widget.Entry
 	metaKeyEntry *widget.Entry
 	metaValEntry *widget.Entry
@@ -96,6 +100,9 @@ func (a *App) buildUI() {
 		ShowLCSCImportDialog(a.win, a.mgr, a.refreshData)
 	})
 	newLibBtn := widget.NewButtonWithIcon("New Library", theme.ContentAddIcon(), a.showCreateLibraryDialog)
+	manageLibsBtn := widget.NewButtonWithIcon("Manage Libraries", theme.VisibilityIcon(), func() {
+		ShowManageLibrariesWindow(a.win, a.mgr, a.refreshData)
+	})
 	regenBtn := widget.NewButtonWithIcon("Regenerate All", theme.ViewRefreshIcon(), a.handleRegenerateAll)
 	exportBtn := widget.NewButtonWithIcon("Export .zip", theme.DocumentSaveIcon(), a.handleExportSelectedLibrary)
 	settingsBtn := widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), func() {
@@ -126,6 +133,7 @@ func (a *App) buildUI() {
 			importLCSCBtn,
 			widget.NewSeparator(),
 			newLibBtn,
+			manageLibsBtn,
 			regenBtn,
 			exportBtn,
 			layout.NewSpacer(),
@@ -137,6 +145,12 @@ func (a *App) buildUI() {
 	)
 
 	// Left Sidebar: Libraries
+	a.libSearchEntry = widget.NewEntry()
+	a.libSearchEntry.SetPlaceHolder("Search shown libraries...")
+	a.libSearchEntry.OnChanged = func(_ string) {
+		a.applyLibraryFilter()
+	}
+
 	a.libList = widget.NewList(
 		func() int { return len(a.libraries) + 1 },
 		func() fyne.CanvasObject {
@@ -148,7 +162,7 @@ func (a *App) buildUI() {
 			lbl := obj.(*widget.Label)
 			if id == 0 {
 				total := 0
-				for _, l := range a.libraries {
+				for _, l := range a.visibleLibraries {
 					total += l.PartCount
 				}
 				lbl.TextStyle = fyne.TextStyle{Bold: true}
@@ -157,7 +171,11 @@ func (a *App) buildUI() {
 			}
 			lib := a.libraries[id-1]
 			lbl.TextStyle = fyne.TextStyle{}
-			lbl.SetText(fmt.Sprintf("%s (%d)", lib.Name, lib.PartCount))
+			suffix := ""
+			if !lib.KiCadEnabled {
+				suffix = " [KiCad Off]"
+			}
+			lbl.SetText(fmt.Sprintf("%s (%d)%s", lib.Name, lib.PartCount, suffix))
 		},
 	)
 	a.libList.OnSelected = func(id widget.ListItemID) {
@@ -166,14 +184,27 @@ func (a *App) buildUI() {
 		} else if id-1 < len(a.libraries) {
 			a.selectedLibID = a.libraries[id-1].ID
 		}
+		a.updateSelectedLibraryControls()
 		a.refreshParts()
 	}
 
+	manageSideBtn := widget.NewButtonWithIcon("Manage...", theme.VisibilityIcon(), func() {
+		ShowManageLibrariesWindow(a.win, a.mgr, a.refreshData)
+	})
+	hideLibBtn := widget.NewButtonWithIcon("Hide Lib", theme.VisibilityOffIcon(), a.handleHideSelectedLibrary)
+	a.toggleKiCadBtn = widget.NewButtonWithIcon("KiCad On/Off", theme.ConfirmIcon(), a.handleToggleSelectedLibraryKiCad)
 	delLibBtn := widget.NewButtonWithIcon("Delete Lib", theme.DeleteIcon(), a.handleDeleteSelectedLibrary)
 	regenLibBtn := widget.NewButtonWithIcon("Regen Lib", theme.ViewRefreshIcon(), a.handleRegenerateSelectedLibrary)
 	sidebar := container.NewBorder(
-		container.NewHBox(widget.NewLabelWithStyle("Libraries", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), layout.NewSpacer()),
-		container.NewGridWithColumns(2, regenLibBtn, delLibBtn),
+		container.NewVBox(
+			container.NewHBox(
+				widget.NewLabelWithStyle("Libraries", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+				layout.NewSpacer(),
+				manageSideBtn,
+			),
+			a.libSearchEntry,
+		),
+		container.NewGridWithColumns(2, hideLibBtn, a.toggleKiCadBtn, regenLibBtn, delLibBtn),
 		nil, nil,
 		a.libList,
 	)
@@ -300,16 +331,65 @@ func (a *App) refreshData() {
 		dialog.ShowError(err, a.win)
 		return
 	}
-	a.libraries = libs
-	a.libList.Refresh()
+	a.allLibraries = libs
+	visible := make([]db.Library, 0, len(libs))
+	selectedStillVisible := a.selectedLibID == 0
+	for _, l := range libs {
+		if !l.Hidden {
+			visible = append(visible, l)
+			if l.ID == a.selectedLibID {
+				selectedStillVisible = true
+			}
+		}
+	}
+	a.visibleLibraries = visible
+	if !selectedStillVisible {
+		a.selectedLibID = 0
+		a.libList.Select(0)
+	}
+	a.applyLibraryFilter()
 	a.inspector.SetLibraries(libs)
 	a.refreshParts()
 }
 
+func (a *App) applyLibraryFilter() {
+	query := ""
+	if a.libSearchEntry != nil {
+		query = a.libSearchEntry.Text
+	}
+	a.libraries = filterLibraries(a.visibleLibraries, query, false, false)
+	if a.libList != nil {
+		a.libList.Refresh()
+	}
+	a.updateSelectedLibraryControls()
+}
+
+func (a *App) updateSelectedLibraryControls() {
+	if a.toggleKiCadBtn == nil {
+		return
+	}
+	if a.selectedLibID <= 0 {
+		a.toggleKiCadBtn.SetText("KiCad On/Off")
+		return
+	}
+	for _, l := range a.visibleLibraries {
+		if l.ID == a.selectedLibID {
+			if l.KiCadEnabled {
+				a.toggleKiCadBtn.SetText("Disable KiCad")
+			} else {
+				a.toggleKiCadBtn.SetText("Enable KiCad")
+			}
+			return
+		}
+	}
+	a.toggleKiCadBtn.SetText("KiCad On/Off")
+}
+
 func (a *App) refreshParts() {
 	filter := db.SearchFilter{
-		Query:     strings.TrimSpace(a.searchEntry.Text),
-		LibraryID: a.selectedLibID,
+		Query:         strings.TrimSpace(a.searchEntry.Text),
+		LibraryID:     a.selectedLibID,
+		ExcludeHidden: true,
 	}
 	mk := strings.TrimSpace(a.metaKeyEntry.Text)
 	mv := strings.TrimSpace(a.metaValEntry.Text)
@@ -329,13 +409,16 @@ func (a *App) refreshParts() {
 	a.parts = parts
 	a.partsList.Refresh()
 	totalParts := 0
-	for _, l := range a.libraries {
+	for _, l := range a.visibleLibraries {
 		totalParts += l.PartCount
 	}
-	if a.selectedLibID == 0 && strings.TrimSpace(a.searchEntry.Text) == "" && totalParts > len(parts) {
-		a.statusLbl.SetText(fmt.Sprintf("Showing %d of %d part(s) across %d library(ies) (search or select a library)", len(parts), totalParts, len(a.libraries)))
-	} else {
-		a.statusLbl.SetText(fmt.Sprintf("%d part(s) across %d library(ies)", len(parts), len(a.libraries)))
+	switch {
+	case len(a.visibleLibraries) == 0:
+		a.statusLbl.SetText(fmt.Sprintf("0 part(s) across 0 shown library(ies) (%d hidden — click 'Manage Libraries' to un-hide)", len(a.allLibraries)))
+	case a.selectedLibID == 0 && strings.TrimSpace(a.searchEntry.Text) == "" && totalParts > len(parts):
+		a.statusLbl.SetText(fmt.Sprintf("Showing %d of %d part(s) across %d shown library(ies) (search or select a library)", len(parts), totalParts, len(a.visibleLibraries)))
+	default:
+		a.statusLbl.SetText(fmt.Sprintf("%d part(s) across %d shown library(ies)", len(parts), len(a.visibleLibraries)))
 	}
 }
 
@@ -433,6 +516,44 @@ func (a *App) handleRegenerateSelectedLibrary() {
 		return
 	}
 	a.statusLbl.SetText("Library regenerated on disk.")
+}
+
+func (a *App) handleHideSelectedLibrary() {
+	if a.selectedLibID <= 0 {
+		dialog.ShowInformation("Hide Library", "Select a specific library in the sidebar first.", a.win)
+		return
+	}
+	if err := a.mgr.DB().SetLibraryHidden(a.selectedLibID, true); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	a.selectedLibID = 0
+	a.libList.Select(0)
+	a.inspector.SetPart(nil)
+	a.refreshData()
+}
+
+func (a *App) handleToggleSelectedLibraryKiCad() {
+	if a.selectedLibID <= 0 {
+		dialog.ShowInformation("KiCad Library Status", "Select a specific library in the sidebar first.", a.win)
+		return
+	}
+	lib, err := a.mgr.DB().GetLibrary(a.selectedLibID)
+	if err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	nextEnabled := !lib.KiCadEnabled
+	if err := a.mgr.SetLibraryKiCadEnabled(lib.ID, nextEnabled); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	a.refreshData()
+	if nextEnabled {
+		a.statusLbl.SetText(fmt.Sprintf("Enabled library %q in KiCad.", lib.Name))
+	} else {
+		a.statusLbl.SetText(fmt.Sprintf("Disabled library %q in KiCad.", lib.Name))
+	}
 }
 
 func (a *App) handleDeleteSelectedLibrary() {

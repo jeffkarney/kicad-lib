@@ -26,6 +26,10 @@ func (d *DB) SearchParts(filter SearchFilter) ([]Part, error) {
 		args = append(args, filter.LibraryID)
 	}
 
+	if filter.ExcludeHidden {
+		where = append(where, "l.hidden = 0")
+	}
+
 	if filter.Has3DModel != nil {
 		if *filter.Has3DModel {
 			where = append(where, "EXISTS (SELECT 1 FROM models_3d m WHERE m.part_id = p.id)")

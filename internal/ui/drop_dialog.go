@@ -69,20 +69,31 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 	})
 
 	libs, _ := mgr.DB().ListLibraries()
-	libNames := make([]string, 0, len(libs))
 	libIDByName := make(map[string]int64, len(libs))
+	hasVisibleLib := false
 	for _, l := range libs {
-		libNames = append(libNames, l.Name)
 		libIDByName[l.Name] = l.ID
+		if !l.Hidden {
+			hasVisibleLib = true
+		}
 	}
 
 	// Target library selection vs inline creation
 	modeExisting := "Add to Existing Library"
 	modeNew := "Create New Library"
-	existingSelect := widget.NewSelect(libNames, nil)
-	if len(libNames) > 0 {
-		existingSelect.SetSelectedIndex(0)
+	libFilterEntry := widget.NewEntry()
+	libFilterEntry.SetPlaceHolder("Search target libraries...")
+	showHiddenCheck := widget.NewCheck("Include hidden libraries", nil)
+	if !hasVisibleLib && len(libs) > 0 {
+		showHiddenCheck.SetChecked(true)
 	}
+	existingSelect := widget.NewSelect(nil, nil)
+	existingSelect.PlaceHolder = "Select target library..."
+	existingLibBox := container.NewVBox(
+		container.NewBorder(nil, nil, nil, showHiddenCheck, libFilterEntry),
+		existingSelect,
+	)
+
 	newLibNameEntry := widget.NewEntry()
 	newLibNameEntry.SetPlaceHolder("New library name (e.g. Custom_ICs)")
 	newLibDescEntry := widget.NewEntry()
@@ -90,12 +101,12 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 
 	newLibBox := container.NewVBox(newLibNameEntry, newLibDescEntry)
 	targetModeRadio := widget.NewRadioGroup([]string{modeExisting, modeNew}, nil)
-	if len(libNames) > 0 {
+	if len(libs) > 0 {
 		targetModeRadio.SetSelected(modeExisting)
 		newLibBox.Hide()
 	} else {
 		targetModeRadio.SetSelected(modeNew)
-		existingSelect.Hide()
+		existingLibBox.Hide()
 	}
 
 	currentTargetLibID := func() int64 {
@@ -323,12 +334,42 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		}
 	}
 
+	applyTargetLibFilter := func(triggerDupRefresh bool) {
+		filtered := filterLibraries(libs, libFilterEntry.Text, showHiddenCheck.Checked, false)
+		opts := make([]string, 0, len(filtered))
+		for _, l := range filtered {
+			opts = append(opts, l.Name)
+		}
+		prev := existingSelect.Selected
+		existingSelect.Options = opts
+		switch {
+		case prev != "" && containsString(opts, prev):
+			existingSelect.Selected = prev
+		case len(opts) > 0:
+			existingSelect.Selected = opts[0]
+		default:
+			existingSelect.Selected = ""
+		}
+		existingSelect.Refresh()
+		if triggerDupRefresh && existingSelect.Selected != prev {
+			refreshAllDuplicates(currentTargetLibID())
+		}
+	}
+	applyTargetLibFilter(false)
+
+	libFilterEntry.OnChanged = func(_ string) {
+		applyTargetLibFilter(true)
+	}
+	showHiddenCheck.OnChanged = func(_ bool) {
+		applyTargetLibFilter(true)
+	}
+
 	targetModeRadio.OnChanged = func(sel string) {
 		if sel == modeNew {
-			existingSelect.Hide()
+			existingLibBox.Hide()
 			newLibBox.Show()
 		} else {
-			existingSelect.Show()
+			existingLibBox.Show()
 			newLibBox.Hide()
 		}
 		refreshAllDuplicates(currentTargetLibID())
@@ -619,7 +660,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 
 	targetCard := widget.NewCard("Target KiCad Library", "", container.NewVBox(
 		targetModeRadio,
-		existingSelect,
+		existingLibBox,
 		newLibBox,
 	))
 

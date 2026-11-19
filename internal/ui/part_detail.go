@@ -37,11 +37,12 @@ type PartInspector struct {
 	editMeta  map[string]string
 	metaKeys  []string
 
-	titleLbl   *widget.Label
-	libBadge   *widget.Label
-	moveSelect *widget.Select
-	moveBtn    *widget.Button
-	deleteBtn  *widget.Button
+	titleLbl        *widget.Label
+	libBadge        *widget.Label
+	moveFilterEntry *widget.Entry
+	moveSelect      *widget.Select
+	moveBtn         *widget.Button
+	deleteBtn       *widget.Button
 
 	valEntry    *widget.Entry
 	mpnEntry    *widget.Entry
@@ -83,6 +84,11 @@ func NewPartInspector(win fyne.Window, mgr *storage.Manager, onChanged func()) *
 	pi.titleLbl = widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	pi.libBadge = widget.NewLabel("")
 
+	pi.moveFilterEntry = widget.NewEntry()
+	pi.moveFilterEntry.SetPlaceHolder("Filter target libraries...")
+	pi.moveFilterEntry.OnChanged = func(_ string) {
+		pi.refreshMoveOptions(false)
+	}
 	pi.moveSelect = widget.NewSelect(nil, nil)
 	pi.moveSelect.PlaceHolder = "Move to library..."
 	pi.moveBtn = widget.NewButtonWithIcon("Move", theme.MoveUpIcon(), pi.handleMovePart)
@@ -173,6 +179,7 @@ func NewPartInspector(win fyne.Window, mgr *storage.Manager, onChanged func()) *
 	header := container.NewVBox(
 		container.NewHBox(pi.titleLbl, layout.NewSpacer(), pi.deleteBtn),
 		pi.libBadge,
+		pi.moveFilterEntry,
 		container.NewBorder(nil, nil, nil, pi.moveBtn, pi.moveSelect),
 		widget.NewSeparator(),
 	)
@@ -195,12 +202,47 @@ func (pi *PartInspector) CanvasObject() fyne.CanvasObject {
 // SetLibraries updates the target library options in the Move dropdown.
 func (pi *PartInspector) SetLibraries(libs []db.Library) {
 	pi.libraries = libs
-	names := make([]string, 0, len(libs))
-	for _, l := range libs {
+	pi.refreshMoveOptions(false)
+}
+
+func (pi *PartInspector) refreshMoveOptions(preferPartLib bool) {
+	query := ""
+	if pi.moveFilterEntry != nil {
+		query = pi.moveFilterEntry.Text
+	}
+	filtered := filterLibraries(pi.libraries, query, true, false)
+	names := make([]string, 0, len(filtered))
+	for _, l := range filtered {
 		names = append(names, l.Name)
 	}
+	if pi.part != nil && pi.part.LibraryName != "" && strings.TrimSpace(query) == "" && !containsString(names, pi.part.LibraryName) {
+		names = append(names, pi.part.LibraryName)
+	}
+
+	prevSel := pi.moveSelect.Selected
 	pi.moveSelect.Options = names
+	switch {
+	case preferPartLib && pi.part != nil && containsString(names, pi.part.LibraryName):
+		pi.moveSelect.SetSelected(pi.part.LibraryName)
+	case !preferPartLib && prevSel != "" && containsString(names, prevSel):
+		pi.moveSelect.SetSelected(prevSel)
+	case pi.part != nil && containsString(names, pi.part.LibraryName):
+		pi.moveSelect.SetSelected(pi.part.LibraryName)
+	case len(names) > 0:
+		pi.moveSelect.SetSelected(names[0])
+	default:
+		pi.moveSelect.ClearSelected()
+	}
 	pi.moveSelect.Refresh()
+}
+
+func containsString(slice []string, target string) bool {
+	for _, s := range slice {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }
 
 // SetPart populates the inspector with the given part (or clears it if nil).
@@ -217,7 +259,7 @@ func (pi *PartInspector) SetPart(p *db.Part) {
 
 	pi.titleLbl.SetText(p.Name)
 	pi.libBadge.SetText(fmt.Sprintf("Library: %s   |   Source: %s", p.LibraryName, p.SourceType))
-	pi.moveSelect.SetSelected(p.LibraryName)
+	pi.refreshMoveOptions(true)
 
 	pi.valEntry.SetText(p.Value)
 	pi.mpnEntry.SetText(p.MPN)

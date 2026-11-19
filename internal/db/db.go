@@ -155,6 +155,8 @@ func (d *DB) migrate() error {
 		{"source_uri", `ALTER TABLE libraries ADD COLUMN source_uri TEXT NOT NULL DEFAULT ''`},
 		{"fp_source_uri", `ALTER TABLE libraries ADD COLUMN fp_source_uri TEXT NOT NULL DEFAULT ''`},
 		{"source_mtime", `ALTER TABLE libraries ADD COLUMN source_mtime INTEGER NOT NULL DEFAULT 0`},
+		{"hidden", `ALTER TABLE libraries ADD COLUMN hidden INTEGER NOT NULL DEFAULT 1`},
+		{"kicad_enabled", `ALTER TABLE libraries ADD COLUMN kicad_enabled INTEGER NOT NULL DEFAULT 1`},
 	}
 	for _, a := range alterStmts {
 		if !cols[a.col] {
@@ -207,16 +209,32 @@ func (d *DB) CreateLibrary(name, description string) (*Library, error) {
 	return d.GetLibrary(id)
 }
 
+const librarySelectCols = `
+	SELECT l.id, l.name, l.description, l.source_uri, l.fp_source_uri, l.source_mtime,
+	       l.hidden, l.kicad_enabled, l.created_at, l.updated_at, COUNT(p.id)
+	FROM libraries l
+	LEFT JOIN parts p ON p.library_id = l.id`
+
+func scanLibrary(scanner interface{ Scan(...any) error }) (Library, error) {
+	var lib Library
+	var hiddenInt, enabledInt int
+	err := scanner.Scan(
+		&lib.ID, &lib.Name, &lib.Description, &lib.SourceURI, &lib.FPSourceURI, &lib.SourceMtime,
+		&hiddenInt, &enabledInt, &lib.CreatedAt, &lib.UpdatedAt, &lib.PartCount,
+	)
+	if err != nil {
+		return lib, err
+	}
+	lib.Hidden = hiddenInt != 0
+	lib.KiCadEnabled = enabledInt != 0
+	return lib, nil
+}
+
 // GetLibrary fetches a library by ID.
 func (d *DB) GetLibrary(id int64) (*Library, error) {
-	row := d.conn.QueryRow(`
-		SELECT l.id, l.name, l.description, l.source_uri, l.fp_source_uri, l.source_mtime, l.created_at, l.updated_at, COUNT(p.id)
-		FROM libraries l
-		LEFT JOIN parts p ON p.library_id = l.id
-		WHERE l.id = ?
-		GROUP BY l.id`, id)
-	var lib Library
-	if err := row.Scan(&lib.ID, &lib.Name, &lib.Description, &lib.SourceURI, &lib.FPSourceURI, &lib.SourceMtime, &lib.CreatedAt, &lib.UpdatedAt, &lib.PartCount); err != nil {
+	row := d.conn.QueryRow(librarySelectCols+` WHERE l.id = ? GROUP BY l.id`, id)
+	lib, err := scanLibrary(row)
+	if err != nil {
 		return nil, err
 	}
 	return &lib, nil
@@ -224,14 +242,9 @@ func (d *DB) GetLibrary(id int64) (*Library, error) {
 
 // GetLibraryByName fetches a library by its exact name.
 func (d *DB) GetLibraryByName(name string) (*Library, error) {
-	row := d.conn.QueryRow(`
-		SELECT l.id, l.name, l.description, l.source_uri, l.fp_source_uri, l.source_mtime, l.created_at, l.updated_at, COUNT(p.id)
-		FROM libraries l
-		LEFT JOIN parts p ON p.library_id = l.id
-		WHERE l.name = ?
-		GROUP BY l.id`, strings.TrimSpace(name))
-	var lib Library
-	if err := row.Scan(&lib.ID, &lib.Name, &lib.Description, &lib.SourceURI, &lib.FPSourceURI, &lib.SourceMtime, &lib.CreatedAt, &lib.UpdatedAt, &lib.PartCount); err != nil {
+	row := d.conn.QueryRow(librarySelectCols+` WHERE l.name = ? GROUP BY l.id`, strings.TrimSpace(name))
+	lib, err := scanLibrary(row)
+	if err != nil {
 		return nil, err
 	}
 	return &lib, nil
@@ -239,12 +252,7 @@ func (d *DB) GetLibraryByName(name string) (*Library, error) {
 
 // ListLibraries returns all libraries ordered alphabetically with part counts.
 func (d *DB) ListLibraries() ([]Library, error) {
-	rows, err := d.conn.Query(`
-		SELECT l.id, l.name, l.description, l.source_uri, l.fp_source_uri, l.source_mtime, l.created_at, l.updated_at, COUNT(p.id)
-		FROM libraries l
-		LEFT JOIN parts p ON p.library_id = l.id
-		GROUP BY l.id
-		ORDER BY LOWER(l.name) ASC`)
+	rows, err := d.conn.Query(librarySelectCols + ` GROUP BY l.id ORDER BY LOWER(l.name) ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -252,13 +260,89 @@ func (d *DB) ListLibraries() ([]Library, error) {
 
 	var libs []Library
 	for rows.Next() {
-		var lib Library
-		if err := rows.Scan(&lib.ID, &lib.Name, &lib.Description, &lib.SourceURI, &lib.FPSourceURI, &lib.SourceMtime, &lib.CreatedAt, &lib.UpdatedAt, &lib.PartCount); err != nil {
+		lib, err := scanLibrary(rows)
+		if err != nil {
 			return nil, err
 		}
 		libs = append(libs, lib)
 	}
 	return libs, rows.Err()
+}
+
+// ListLibraryIDsWithManagedParts returns the set of library IDs containing at least one
+// non-kicad_sync (user-managed) part without hydrating part relations or reading vault files.
+func (d *DB) ListLibraryIDsWithManagedParts() (map[int64]bool, error) {
+	rows, err := d.conn.Query(`SELECT DISTINCT library_id FROM parts WHERE source_type != 'kicad_sync'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// SetLibraryHidden updates whether a single library is hidden in the main UI.
+func (d *DB) SetLibraryHidden(id int64, hidden bool) error {
+	return d.SetLibrariesHidden([]int64{id}, hidden)
+}
+
+// SetLibrariesHidden transactionally updates the hidden flag for the specified library IDs.
+func (d *DB) SetLibrariesHidden(ids []int64, hidden bool) error {
+	return d.updateLibraryBoolColumn(ids, "hidden", hidden)
+}
+
+// SetLibraryKiCadEnabled updates whether a single library is marked enabled in KiCad.
+func (d *DB) SetLibraryKiCadEnabled(id int64, enabled bool) error {
+	return d.SetLibrariesKiCadEnabled([]int64{id}, enabled)
+}
+
+// SetLibrariesKiCadEnabled transactionally updates the kicad_enabled flag for the specified library IDs.
+func (d *DB) SetLibrariesKiCadEnabled(ids []int64, enabled bool) error {
+	return d.updateLibraryBoolColumn(ids, "kicad_enabled", enabled)
+}
+
+func (d *DB) updateLibraryBoolColumn(ids []int64, column string, val bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if column != "hidden" && column != "kicad_enabled" {
+		return fmt.Errorf("invalid boolean column %q", column)
+	}
+	intVal := 0
+	if val {
+		intVal = 1
+	}
+	now := time.Now().UTC()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`UPDATE libraries SET ` + column + ` = ?, updated_at = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, err := stmt.Exec(intVal, now, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // IsLibrarySyncUpToDate reports whether a library already exists with matching sourceURI and sourceMtime.

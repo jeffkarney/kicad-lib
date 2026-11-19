@@ -524,3 +524,91 @@ func TestExtractSymbolSExprFromDirectory(t *testing.T) {
 	}
 }
 
+func TestLibTableEnableDisableAndDisabledParsing(t *testing.T) {
+	cfgDir := t.TempDir()
+	symPath := "/tmp/libs/Timers.kicad_sym"
+	fpPath := "/tmp/libs/Timers.pretty"
+
+	if err := RegisterSymbolLibrary(cfgDir, "Timers", symPath, "Timer ICs"); err != nil {
+		t.Fatalf("RegisterSymbolLibrary failed: %v", err)
+	}
+	if err := RegisterFootprintLibrary(cfgDir, "Timers", fpPath, "Timer Footprints"); err != nil {
+		t.Fatalf("RegisterFootprintLibrary failed: %v", err)
+	}
+
+	// Disable both entries
+	if err := SetSymbolLibraryEnabled(cfgDir, "Timers", symPath, "Timer ICs", false); err != nil {
+		t.Fatalf("SetSymbolLibraryEnabled(false) failed: %v", err)
+	}
+	if err := SetFootprintLibraryEnabled(cfgDir, "Timers", fpPath, "Timer Footprints", false); err != nil {
+		t.Fatalf("SetFootprintLibraryEnabled(false) failed: %v", err)
+	}
+
+	symRaw, err := os.ReadFile(filepath.Join(cfgDir, "sym-lib-table"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(symRaw), "(disabled)") || !strings.Contains(string(symRaw), symPath) {
+		t.Fatalf("expected (disabled) and preserved URI in sym-lib-table, got:\n%s", string(symRaw))
+	}
+	fpRaw, err := os.ReadFile(filepath.Join(cfgDir, "fp-lib-table"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fpRaw), "(disabled)") || !strings.Contains(string(fpRaw), fpPath) {
+		t.Fatalf("expected (disabled) and preserved URI in fp-lib-table, got:\n%s", string(fpRaw))
+	}
+
+	// LoadEffectiveLibTables should return disabled entries with Disabled=true
+	syms, fps, _, err := LoadEffectiveLibTables(cfgDir, "", nil, false)
+	if err != nil {
+		t.Fatalf("LoadEffectiveLibTables failed: %v", err)
+	}
+	if len(syms) != 1 || !syms[0].Disabled {
+		t.Fatalf("expected Timers symbol lib Disabled=true, got %+v", syms)
+	}
+	if len(fps) != 1 || !fps[0].Disabled {
+		t.Fatalf("expected Timers fp lib Disabled=true, got %+v", fps)
+	}
+
+	// Re-enable both entries
+	if err := SetSymbolLibraryEnabled(cfgDir, "Timers", symPath, "Timer ICs", true); err != nil {
+		t.Fatalf("SetSymbolLibraryEnabled(true) failed: %v", err)
+	}
+	if err := SetFootprintLibraryEnabled(cfgDir, "Timers", fpPath, "Timer Footprints", true); err != nil {
+		t.Fatalf("SetFootprintLibraryEnabled(true) failed: %v", err)
+	}
+	syms2, fps2, _, err := LoadEffectiveLibTables(cfgDir, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syms2) != 1 || syms2[0].Disabled {
+		t.Fatalf("expected Timers symbol lib Disabled=false after re-enable, got %+v", syms2)
+	}
+	if len(fps2) != 1 || fps2[0].Disabled {
+		t.Fatalf("expected Timers fp lib Disabled=false after re-enable, got %+v", fps2)
+	}
+
+	// Verify user-level disabled entry overrides nested (type "Table") stock entry
+	stockTable := filepath.Join(cfgDir, "stock-sym-lib-table")
+	if err := os.WriteFile(stockTable, []byte(`(sym_lib_table (version 7)
+	(lib (name "Device") (type "KiCad") (uri "/stock/Device.kicad_sym") (options "") (descr "Stock"))
+)`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	userTable := `(sym_lib_table (version 7)
+	(lib (name "KiCad") (type "Table") (uri "` + stockTable + `") (options "") (descr "Stock Table"))
+	(lib (name "Device") (type "KiCad") (uri "/stock/Device.kicad_sym") (options "") (descr "Stock") (disabled))
+)`
+	if err := os.WriteFile(filepath.Join(cfgDir, "sym-lib-table"), []byte(userTable), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mergedSyms, _, _, err := LoadEffectiveLibTables(cfgDir, "", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mergedSyms) != 1 || mergedSyms[0].Name != "Device" || !mergedSyms[0].Disabled {
+		t.Fatalf("expected user disabled Device entry to override nested stock table, got %+v", mergedSyms)
+	}
+}
+

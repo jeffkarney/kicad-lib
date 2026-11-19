@@ -1,6 +1,6 @@
 # Project History & Architecture Summary (`kicad-lib`)
 
-**Last Updated:** 2026-11-18
+**Last Updated:** 2026-11-19
 **Repository:** `/home/jeffk/Documents/Projects/kicad-lib`
 **Module:** `github.com/jeffk/kicad-lib` (Go `1.26.0`)
 
@@ -49,14 +49,15 @@ nix-shell --run "./bin/kicad-lib"
     - `cache/{git,previews}/` (`GitCacheDir`, `PreviewCacheDir`)
 
 ### Database Layer (`internal/db/`)
-- `models.go`: Structs `Library`, `Part`, `Symbol`, `Footprint`, `Model3D`, `SearchFilter`.
+- `models.go`: Structs `Library` (with `Hidden`, `KiCadEnabled`), `Part`, `Symbol`, `Footprint`, `Model3D`, `SearchFilter` (with `ExcludeHidden`).
 - `db.go`:
-  - Schema tables: `libraries` (with `source_uri`, `fp_source_uri`, `source_mtime`), `parts` (`UNIQUE(library_id, name)`), `symbols`, `footprints`, `models_3d`, `part_metadata`, and virtual table `parts_fts` (`FTS5`).
-  - `BulkSyncLibrary`: Transactionally syncs external KiCad libraries (`source_type = 'kicad_sync'`) while preserving user-added/modified parts in the same library.
+  - Schema tables: `libraries` (with `source_uri`, `fp_source_uri`, `source_mtime`, `hidden` defaulting to `1`, `kicad_enabled` defaulting to `1`), `parts` (`UNIQUE(library_id, name)`), `symbols`, `footprints`, `models_3d`, `part_metadata`, and virtual table `parts_fts` (`FTS5`).
+  - Visibility & KiCad enable/disable helpers: `SetLibraryHidden`, `SetLibrariesHidden`, `SetLibraryKiCadEnabled`, `SetLibrariesKiCadEnabled`.
+  - `BulkSyncLibrary`: Transactionally syncs external KiCad libraries (`source_type = 'kicad_sync'`) while preserving user-added/modified parts and existing `hidden`/`kicad_enabled` flags in the same library.
   - `hydratePartRelations`: Loads `Symbol`, `Footprint`, `Models3D`, and `Metadata`, lazy-loading `RawSExpr` from `VaultPath` when needed.
   - `FindDuplicateParts(name, mpn, lcscPart string, targetLibraryID int64)`: Case-insensitive duplicate lookup by Part Name, MPN, or LCSC Part ID, prioritizing matches in `targetLibraryID`.
-- `search.go`: `SearchParts` joins `parts`, `libraries`, `symbols`, `footprints`, `parts_fts`, and `part_metadata` for fast browsing without eagerly loading `raw_sexpr`.
-- `db_test.go`: `TestDBLifecycleAndFTS5Search`.
+- `search.go`: `SearchParts` joins `parts`, `libraries`, `symbols`, `footprints`, `parts_fts`, and `part_metadata` for fast browsing without eagerly loading `raw_sexpr`, supporting `ExcludeHidden` filtering (`l.hidden = 0`).
+- `db_test.go`: `TestDBLifecycleAndFTS5Search`, `TestLibraryVisibilityAndKiCadEnabled`.
 
 ### KiCad File, IPC & Rendering Layer (`internal/kicad/`)
 - `sexpr.go`: Full S-expression AST (`Node`, `ParseSExpr`, `ParseAllSExpr`, `PrettyString`, `FindProperty`, `SetOrAddProperty`, `Clone`).
@@ -66,19 +67,19 @@ nix-shell --run "./bin/kicad-lib"
   - `ExtractFromSchematic`: Parses `.kicad_sch`, extracts `(lib_symbols ...)` definitions, strips `<Lib>:` prefixes (and sub-unit prefixes), filters power/flag symbols (`power:*` / `(power)`) unless only power symbols exist, and merges missing properties (`Footprint`, `Datasheet`, `Description`, `ki_keywords`, `MPN`, `Manufacturer`, `LCSC`, custom metadata) from placed schematic `(symbol (lib_id ...) ...)` instances.
   - `ExtractSchematicSheetFiles`: Returns hierarchical `(sheet ... (property "Sheetfile" ...))` sub-sheet paths.
   - `ExtractFromPCB`: Parses `.kicad_pcb`, selects the best placement instance per footprint name (preferring `F.Cu`, `rot == 0`), strips board-instance attributes (`at`, `locked`, `uuid`, `tstamp`, `path`, `sheetname`, `sheetfile`, pad `net`/`pinfunction`/`pintype`), flips `B.*` layers + removes `(justify mirror)` on back-mounted footprints, and subtracts board placement rotation from pad/text angles to yield valid `.kicad_mod` S-expressions.
-- `libtable.go`: `RegisterSymbolLibrary`, `RegisterFootprintLibrary`, `UnregisterLibrary`, `ResolveKiCadVariables` (checks user 3rdparty/3dmodels dirs, NixOS `kicad-cli` wrapper exports, `kicad_common.json`, live IPC `GetPaths`, and `os.Environ()`), `ExpandKiCadURI`, `LoadEffectiveLibTables`.
+- `libtable.go`: `RegisterSymbolLibrary`, `RegisterFootprintLibrary`, `SetSymbolLibraryEnabled`, `SetFootprintLibraryEnabled`, `UnregisterLibrary`, `ResolveKiCadVariables` (checks user 3rdparty/3dmodels dirs, NixOS `kicad-cli` wrapper exports, `kicad_common.json`, live IPC `GetPaths`, and `os.Environ()`), `ExpandKiCadURI`, `LoadEffectiveLibTables` (preserving `Disabled` status and user-table precedence over nested tables).
 - `cli.go`: Wraps `kicad-cli` (`UpgradeSymbolLib`, `UpgradeFootprintDir`, `ExportSymbolSVG`, `ExportFootprintSVG`).
 - `ipc.go`: Pure-Go KiCad 9/10 IPC client over NNG `req` + Unix IPC transport + `protowire` (`CheckStatus`, `DiscoverSocket`, `GetVersion`, `GetOpenDocuments`, `GetPaths`, `RefreshLibrariesAndNotify`).
 - `render2d.go`: Parses symbol/footprint S-expressions (`ParseFootprintDrawing`, `ParseSymbolDrawing`, `ParseSymbolDrawingFromFile` with `(extends ...)` resolution) and rasterizes `Drawing2D` with zoom/pan (`RenderDrawing2D`).
 - `render3d.go`: `Resolve3DModelPath` (probes sibling `.stpZ`/`.stpz`/`.step`/`.stp`/`.wrl` extensions) and `LoadMesh3D` + `RenderMesh3D` supporting ASCII STEP geometry (including face/item styling & cylindrical/toroidal 3D strip bridging), compressed `.stpZ` (both ZIP and gzip), and VRML 2.0 `.wrl` (`IndexedFaceSet`, `Coordinate`, `DEF`/`USE` materials, nested `Transform` hierarchy).
-- `kicad_test.go`: 7 unit tests covering symbols, footprints, lib tables, mock IPC socket, fast parser & variable expansion, 2D rendering, and 3D STEP/WRL rendering.
+- `kicad_test.go`: 9 unit tests covering symbols, footprints, lib tables & enable/disable, mock IPC socket, fast parser & variable expansion, 2D rendering, and 3D STEP/WRL rendering.
 
 ### Storage & Sync Orchestrator (`internal/storage/`)
 - `manager.go`: Coordinates SQLite + vault + generated KiCad libraries + IPC notifications:
   - `ImportPart`: Copies assets to vault, links `<Lib>:<Footprint>`, rewrites footprint 3D model paths, regenerates target library, and registers tables.
   - `MergePart(existingPartID, req, opts)`: Resolves duplicates via `MergeOptions.Strategy` (`"merge"`, `"overwrite"`, `"rename"`, `"skip"`), materializing `kicad_sync` parts into the vault before in-place modification and allowing independent selection of Details, Symbol, Footprint, 3D Models (`"combine"`, `"keep_existing"`, `"use_incoming"`), and Metadata (`"prefer_incoming"`, `"keep_existing"`, `"replace"`).
-  - `MovePart`, `UpdatePart`, `DeletePart`, `Attach3DModel`, `RegenerateLibrary`, `RegenerateAllLibraries`, `ExportLibraryArchive`, `RenderPartPreviews`, `SyncFromKiCad`.
-- `manager_test.go`: `TestStorageLifecycleMoveSearchRegenerateAndExport`, `TestSyncFromKiCadExistingLibraries`, `TestDuplicateDetectionAndMergePart`.
+  - `MovePart`, `UpdatePart`, `DeletePart`, `Attach3DModel`, `RegenerateLibrary`, `RegenerateAllLibraries`, `SetLibraryKiCadEnabled`, `SetLibrariesKiCadEnabled`, `ExportLibraryArchive`, `RenderPartPreviews`, `SyncFromKiCad`.
+- `manager_test.go`: `TestStorageLifecycleMoveSearchRegenerateAndExport`, `TestSyncFromKiCadExistingLibraries`, `TestDuplicateDetectionAndMergePart`, `TestSyncFromKiCadDirectorySymbolLibraries`, `TestSyncFromKiCadStandaloneFootprintLibrary`, `TestSetLibraryKiCadEnabledAndRegeneratePreservesDisabled`.
 
 ### Importers (`internal/importer/`)
 - `archive.go`: `ScanDroppedPaths` and `ScanDirectory` (recursive zip extraction up to depth 3, `.kicad_pro` directory auto-expansion, hierarchical `.kicad_sch` sheet traversal, `.kicad_pcb` extraction with `${KIPRJMOD}` resolution using original dropped dirs, legacy `.lib` v5 upgrade via `kicad-cli` or pure-Go fallback converter, symbol/footprint/3D model pairing, and standalone PCB footprint emission).
@@ -88,14 +89,15 @@ nix-shell --run "./bin/kicad-lib"
 - `archive_test.go`: 5 tests including `TestScanKiCadProjectSchematicAndPCB` (verified against both synthetic projects and the system KiCad `Arduino_Nano` template if present).
 
 ### Desktop GUI (`internal/ui/`)
-- `app.go`: Main window (`1320x820`), drop handler (`SetOnDropped`), toolbar (`Import Zip/File`, `Import Folder`, `Git Repo`, `LCSC`, `New Library`, `Regenerate All`, `Export .zip`, `Sync IPC`, `Settings`), library sidebar, FTS5/metadata/Has-3D filterable part table, status bar, periodic IPC polling.
-- `part_detail.go`: `PartInspector` with `Assets` (interactive 2D Symbol, 2D Footprint, and 3D Model previews + 3D model selector & attachment), `Details`, and `Metadata` (with LCSC/distributor enrichment) tabs, Move Library, Delete Part.
+- `app.go`: Main window (`1320x820`), drop handler (`SetOnDropped`), toolbar (`Import Zip/File`, `Import Folder`, `Git Repo`, `LCSC`, `New Library`, `Manage Libraries`, `Regenerate All`, `Export .zip`, `Sync IPC`, `Settings`), searchable/un-hidden library sidebar (with `Manage...`, `Hide Lib`, `KiCad On/Off`, `Regen Lib`, `Delete Lib`), FTS5/metadata/Has-3D filterable part table (filtered to un-hidden libraries), status bar, periodic IPC polling.
+- `library_manager.go`: `ShowManageLibrariesWindow` resizable window to search libraries (name, description, URI), filter by status (`All`, `Shown`, `Hidden`, `Enabled in KiCad`, `Disabled in KiCad`), toggle individual `Shown` and `In KiCad` checkboxes, and run bulk `Un-hide Filtered`, `Hide Filtered`, `Enable Filtered in KiCad`, and `Disable Filtered in KiCad`.
+- `part_detail.go`: `PartInspector` with `Assets` (interactive 2D Symbol, 2D Footprint, and 3D Model previews + 3D model selector & attachment), `Details`, and `Metadata` (with LCSC/distributor enrichment) tabs, searchable Move Library dropdown, Delete Part.
 - `preview_widget.go`: `InteractivePreviewWidget` (`Scrolled` zoom, `Dragged` 2D pan / 3D orbit+pan), `NewPreviewPanel` toolbar (`ZoomIn`, `ZoomOut`, `Fit`, `Orbit`/`Pan`/`Iso`/`Top`, `Expand`), and `ShowFullWindowPreview` dialog.
-- `drop_dialog.go`: `ShowDropStagingDialog` with candidate list, target library selector / inline creation, inline metadata editing/lookup, automatic duplicate detection, warning banner, per-row duplicate/resolution badges, and sequential unresolved-duplicate resolution flow on Import.
+- `drop_dialog.go`: `ShowDropStagingDialog` with candidate list, searchable target library selector (with `Include hidden libraries` toggle) / inline creation, inline metadata editing/lookup, automatic duplicate detection, warning banner, per-row duplicate/resolution badges, and sequential unresolved-duplicate resolution flow on Import.
 - `duplicate_dialog.go`: `ShowDuplicateCompareDialog` providing side-by-side Existing vs. Incoming part field comparison (`[DIFF]` highlights), full Metadata Diff table, side-by-side interactive 2D/3D previews, and Merge/Overwrite/Rename/Skip controls.
 - `import_online.go`: `ShowGitImportDialog`, `ShowLCSCImportDialog`.
 - `settings.go`: `ShowSettingsDialog`.
-- `ui_test.go`: Headless Fyne tests (`TestPartInspectorHeadless`, `TestInteractivePreviewWidgetZoomPanAndOrbit`, `TestDuplicateCompareDialogHeadless`).
+- `ui_test.go`: Headless Fyne tests (`TestPartInspectorHeadless`, `TestInteractivePreviewWidgetZoomPanAndOrbit`, `TestDuplicateCompareDialogHeadless`, `TestSyncFromKiCadStatusReset`, `TestLibraryVisibilitySearchAndKiCadToggleHeadless`).
 
 ---
 
@@ -140,6 +142,14 @@ nix-shell --run "./bin/kicad-lib"
      - Enabled standard OS resizing (`SetFixedSize(false)`) so users can freely drag borders, corners, or maximize to full screen.
      - Added `Escape` key shortcut to quickly dismiss/cancel the staging window.
      - Wired `ShowDuplicateCompareDialog` to use `stageWin` as its parent and increased its default dimensions responsively (up to 90% of `stageWin`, default 1100x750) for easier side-by-side comparison of 2D/3D models and metadata.
+
+10. **Library Visibility Management, KiCad Enable/Disable, and Library Search Filters**:
+    - *Features*:
+      - **Default Hidden Libraries & Visibility Management**: Added `hidden` (`INTEGER NOT NULL DEFAULT 1`) to SQLite `libraries` schema (`internal/db/db.go`) so all synced and newly created libraries default to hidden until explicitly un-hidden. Added `ExcludeHidden` filtering in `SearchParts` (`internal/db/search.go`) so main browsing (`All Parts`) only displays parts from un-hidden libraries.
+      - **Enable / Disable Libraries in KiCad**: Added `kicad_enabled` (`INTEGER NOT NULL DEFAULT 1`) to `libraries` and implemented `SetSymbolLibraryEnabled` / `SetFootprintLibraryEnabled` in `internal/kicad/libtable.go` to toggle KiCad's `(disabled)` S-expression child node on `(lib ...)` entries in `sym-lib-table` and `fp-lib-table` (preserving existing `${VAR}` URIs and descriptions, and giving user-table entries precedence over nested stock tables in `LoadEffectiveLibTables`). Added `Manager.SetLibraryKiCadEnabled` / `SetLibrariesKiCadEnabled` (`internal/storage/manager.go`) and ensured `RegenerateLibrary` preserves disabled state.
+      - **Manage Libraries Window & Live Library Search Filters**: Created `internal/ui/library_manager.go` (`ShowManageLibrariesWindow`) with live search (by name, description, and URI), status filtering (`All`, `Shown`, `Hidden`, `Enabled in KiCad`, `Disabled in KiCad`), per-row `Shown` and `In KiCad` checkboxes, and bulk actions for filtered rows. Added live library search filters across every spot libraries appear: main sidebar (`internal/ui/app.go`, plus quick `Hide Lib` and `Enable/Disable KiCad` buttons), `PartInspector` Move target selector (`internal/ui/part_detail.go`), and `ShowDropStagingDialog` Target KiCad Library selector (`internal/ui/drop_dialog.go`, with an `Include hidden libraries` toggle).
+      - **Bulk KiCad Toggle Performance Optimization**: Replaced per-library `ListPartsByLibrary` (which hydrated every part and re-parsed `.kicad_sym`/`.kicad_mod` files on disk) and per-library `sym-lib-table`/`fp-lib-table` rewrites with a single SQL query `DB.ListLibraryIDsWithManagedParts()`, a single `DB.ListLibraries()` lookup, and single-pass batch `kicad.SetSymbolLibrariesEnabled` / `SetFootprintLibrariesEnabled` updates (also speeding up `RegenerateAllLibraries`).
+      - **Test Isolation**: Gated `TestLiveKiCadSync` behind `KICAD_LIVE_TEST=1` in `internal/storage/manager_test.go` so routine `go test ./...` runs stay isolated from the host user database and KiCad config.
 
 ---
 

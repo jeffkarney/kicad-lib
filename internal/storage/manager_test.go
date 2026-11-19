@@ -680,6 +680,9 @@ func TestSyncFromKiCadStandaloneFootprintLibrary(t *testing.T) {
 }
 
 func TestLiveKiCadSync(t *testing.T) {
+	if os.Getenv("KICAD_LIVE_TEST") != "1" {
+		t.Skip("skipping live sync test against user database (set KICAD_LIVE_TEST=1 to enable)")
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		t.Skip("skipping live sync test: no config")
@@ -730,6 +733,153 @@ func TestLiveKiCadSync(t *testing.T) {
 		parts, _ := database.ListPartsByLibrary(lib.ID)
 		t.Logf("Verified library in DB: %s (id: %d, parts: %d, source: %s, fp: %s)",
 			lib.Name, lib.ID, len(parts), filepath.Base(lib.SourceURI), filepath.Base(lib.FPSourceURI))
+	}
+}
+
+func TestSetLibraryKiCadEnabledAndRegeneratePreservesDisabled(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:           filepath.Join(tmp, "storage"),
+		KiCadConfigDir:        filepath.Join(tmp, "kicad-cfg"),
+		AutoRegisterLibTables: true,
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Managed library
+	lib, err := database.CreateLibrary("Custom_LEDs", "LED library")
+	if err != nil {
+		t.Fatal(err)
+	}
+	symSExpr := `(symbol "LED_Red"
+		(in_bom yes)
+		(on_board yes)
+		(property "Reference" "D" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "LED_Red" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+		(symbol "LED_Red_1_1"
+			(pin passive line (at -5.08 0 0) (length 2.54) (name "K" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+		)
+	)`
+	if _, err := mgr.ImportPart(ImportPartRequest{
+		LibraryID:   lib.ID,
+		PartName:    "LED_Red",
+		SymbolName:  "LED_Red",
+		SymbolSExpr: symSExpr,
+	}); err != nil {
+		t.Fatalf("ImportPart failed: %v", err)
+	}
+
+	// Initially enabled in both tables
+	syms, fps, _, err := kicad.LoadEffectiveLibTables(cfg.KiCadConfigDir, "", nil, false)
+	if err != nil || len(syms) != 1 || syms[0].Disabled || len(fps) != 1 || fps[0].Disabled {
+		t.Fatalf("expected Custom_LEDs initially enabled, syms=%+v fps=%+v err=%v", syms, fps, err)
+	}
+
+	// Disable in KiCad
+	if err := mgr.SetLibraryKiCadEnabled(lib.ID, false); err != nil {
+		t.Fatalf("SetLibraryKiCadEnabled(false) failed: %v", err)
+	}
+	gotLib, err := database.GetLibrary(lib.ID)
+	if err != nil || gotLib.KiCadEnabled {
+		t.Fatalf("expected DB KiCadEnabled=false, got %+v (err=%v)", gotLib, err)
+	}
+	syms, fps, _, err = kicad.LoadEffectiveLibTables(cfg.KiCadConfigDir, "", nil, false)
+	if err != nil || len(syms) != 1 || !syms[0].Disabled || len(fps) != 1 || !fps[0].Disabled {
+		t.Fatalf("expected Custom_LEDs disabled in KiCad tables, syms=%+v fps=%+v err=%v", syms, fps, err)
+	}
+
+	// Regenerating while disabled should preserve (disabled)
+	if err := mgr.RegenerateLibrary(lib.ID); err != nil {
+		t.Fatalf("RegenerateLibrary failed: %v", err)
+	}
+	syms, fps, _, err = kicad.LoadEffectiveLibTables(cfg.KiCadConfigDir, "", nil, false)
+	if err != nil || len(syms) != 1 || !syms[0].Disabled || len(fps) != 1 || !fps[0].Disabled {
+		t.Fatalf("expected RegenerateLibrary to preserve disabled state, syms=%+v fps=%+v err=%v", syms, fps, err)
+	}
+
+	// Re-enable in KiCad
+	if err := mgr.SetLibraryKiCadEnabled(lib.ID, true); err != nil {
+		t.Fatalf("SetLibraryKiCadEnabled(true) failed: %v", err)
+	}
+	syms, fps, _, err = kicad.LoadEffectiveLibTables(cfg.KiCadConfigDir, "", nil, false)
+	if err != nil || len(syms) != 1 || syms[0].Disabled || len(fps) != 1 || fps[0].Disabled {
+		t.Fatalf("expected Custom_LEDs re-enabled in KiCad tables, syms=%+v fps=%+v err=%v", syms, fps, err)
+	}
+
+	// 2. External kicad_sync library preserves existing ${VAR} URI when toggled
+	thirdPartyDir := filepath.Join(tmp, "3rdparty")
+	symExtDir := filepath.Join(thirdPartyDir, "symbols")
+	fpExtDir := filepath.Join(thirdPartyDir, "footprints", "Ext.pretty")
+	if err := os.MkdirAll(symExtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fpExtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KICAD10_3RD_PARTY", thirdPartyDir)
+	if err := os.WriteFile(filepath.Join(symExtDir, "Ext.kicad_sym"), []byte(`(kicad_symbol_lib (version 20231120) (generator "test")
+		(symbol "ExtPart" (property "Reference" "U" (at 0 0 0)) (property "Value" "ExtPart" (at 0 2 0)) (property "Footprint" "Ext:ExtFP" (at 0 0 0)))
+	)`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fpExtDir, "ExtFP.kicad_mod"), []byte(`(footprint "ExtFP" (layer "F.Cu") (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := kicad.RegisterSymbolLibrary(cfg.KiCadConfigDir, "Ext", "${KICAD10_3RD_PARTY}/symbols/Ext.kicad_sym", "Ext syms"); err != nil {
+		t.Fatal(err)
+	}
+	if err := kicad.RegisterFootprintLibrary(cfg.KiCadConfigDir, "Ext", "${KICAD10_3RD_PARTY}/footprints/Ext.pretty", "Ext fps"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mgr.SyncFromKiCad(nil); err != nil {
+		t.Fatalf("SyncFromKiCad failed: %v", err)
+	}
+	extLib, err := database.GetLibraryByName("Ext")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SetLibraryKiCadEnabled(extLib.ID, false); err != nil {
+		t.Fatalf("SetLibraryKiCadEnabled on external lib failed: %v", err)
+	}
+	rawSymTbl, err := os.ReadFile(filepath.Join(cfg.KiCadConfigDir, "sym-lib-table"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawSymTbl), "${KICAD10_3RD_PARTY}/symbols/Ext.kicad_sym") || !strings.Contains(string(rawSymTbl), "(disabled)") {
+		t.Fatalf("expected preserved ${KICAD10_3RD_PARTY} URI and (disabled) on Ext, got:\n%s", string(rawSymTbl))
+	}
+
+	// 3. Batch-toggle 200 synced libraries in a single pass
+	var batchIDs []int64
+	for i := 0; i < 200; i++ {
+		name := fmt.Sprintf("Bulk_Ext_%03d", i)
+		parts := []db.Part{
+			{Name: fmt.Sprintf("P_%d_1", i), SourceType: "kicad_sync"},
+			{Name: fmt.Sprintf("P_%d_2", i), SourceType: "kicad_sync"},
+		}
+		l, _, berr := database.BulkSyncLibrary(name, "Bulk test", filepath.Join(symExtDir, name+".kicad_sym"), "", 100, parts)
+		if berr != nil {
+			t.Fatalf("BulkSyncLibrary %s failed: %v", name, berr)
+		}
+		batchIDs = append(batchIDs, l.ID)
+	}
+	if err := mgr.SetLibrariesKiCadEnabled(batchIDs, false); err != nil {
+		t.Fatalf("batch SetLibrariesKiCadEnabled(false) failed: %v", err)
+	}
+	if err := mgr.SetLibrariesKiCadEnabled(batchIDs, true); err != nil {
+		t.Fatalf("batch SetLibrariesKiCadEnabled(true) failed: %v", err)
 	}
 }
 

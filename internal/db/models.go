@@ -4,15 +4,17 @@ import "time"
 
 // Library represents a logical KiCad library managed by kicad-lib.
 type Library struct {
-	ID          int64     `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	SourceURI   string    `json:"source_uri"`
-	FPSourceURI string    `json:"fp_source_uri"`
-	SourceMtime int64     `json:"source_mtime"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	PartCount   int       `json:"part_count"`
+	ID           int64     `json:"id"`
+	Name         string    `json:"name"`
+	Description  string    `json:"description"`
+	SourceURI    string    `json:"source_uri"`
+	FPSourceURI  string    `json:"fp_source_uri"`
+	SourceMtime  int64     `json:"source_mtime"`
+	Hidden       bool      `json:"hidden"`
+	KiCadEnabled bool      `json:"kicad_enabled"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	PartCount    int       `json:"part_count"`
 }
 
 // Part represents an electronic component tracked in the vault database.
@@ -84,4 +86,5 @@ type SearchFilter struct {
 	LibraryID       int64
 	MetadataFilters map[string]string
 	Has3DModel      *bool
+	ExcludeHidden   bool
 }

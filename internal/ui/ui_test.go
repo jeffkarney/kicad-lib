@@ -284,3 +284,162 @@ func TestSyncFromKiCadStatusReset(t *testing.T) {
 		t.Fatalf("expected status label to reflect part/library counts, got: %q", finalStatus)
 	}
 }
+
+func TestLibraryVisibilitySearchAndKiCadToggleHeadless(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:           filepath.Join(tmp, "storage"),
+		KiCadConfigDir:        filepath.Join(tmp, "kicad"),
+		AutoRegisterLibTables: true,
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := storage.NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	libAlpha, err := database.CreateLibrary("Alpha_MCU", "Microcontrollers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	libBeta, err := database.CreateLibrary("Beta_Sensors", "Environmental sensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	libGamma, err := database.CreateLibrary("Gamma_Power", "Power regulators")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mgr.ImportPart(storage.ImportPartRequest{LibraryID: libAlpha.ID, PartName: "AlphaPart"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ImportPart(storage.ImportPartRequest{LibraryID: libBeta.ID, PartName: "BetaPart"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ImportPart(storage.ImportPartRequest{LibraryID: libGamma.ID, PartName: "GammaPart"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := test.NewApp()
+	defer a.Quit()
+	w := test.NewWindow(nil)
+	defer w.Close()
+
+	appInstance := &App{
+		fyneApp: a,
+		win:     w,
+		mgr:     mgr,
+	}
+	appInstance.buildUI()
+	appInstance.refreshData()
+
+	// 1. All libraries hidden by default
+	if len(appInstance.allLibraries) != 3 {
+		t.Fatalf("expected 3 total libraries, got %d", len(appInstance.allLibraries))
+	}
+	if len(appInstance.visibleLibraries) != 0 || len(appInstance.libraries) != 0 {
+		t.Fatalf("expected 0 visible libraries by default, got visible=%d shown=%d", len(appInstance.visibleLibraries), len(appInstance.libraries))
+	}
+	if len(appInstance.parts) != 0 {
+		t.Fatalf("expected 0 parts shown when all libraries are hidden, got %d", len(appInstance.parts))
+	}
+	if !strings.Contains(appInstance.statusLbl.Text, "3 hidden") {
+		t.Fatalf("expected status label to report 3 hidden libraries, got %q", appInstance.statusLbl.Text)
+	}
+
+	// 2. Manage Libraries view: search, un-hide, status filter, and KiCad enable/disable
+	lmv := newLibraryManagerView(w, mgr, appInstance.refreshData)
+	if len(lmv.filteredLibs) != 3 {
+		t.Fatalf("expected 3 libraries in manager view, got %d", len(lmv.filteredLibs))
+	}
+	lmv.searchEntry.SetText("Beta")
+	if len(lmv.filteredLibs) != 1 || lmv.filteredLibs[0].Name != "Beta_Sensors" {
+		t.Fatalf("expected Beta_Sensors when filtering by Beta, got %+v", lmv.filteredLibs)
+	}
+	lmv.setFilteredHidden(false)
+	if len(appInstance.visibleLibraries) != 1 || appInstance.visibleLibraries[0].Name != "Beta_Sensors" {
+		t.Fatalf("expected Beta_Sensors un-hidden in main app, got %+v", appInstance.visibleLibraries)
+	}
+	if len(appInstance.parts) != 1 || appInstance.parts[0].Name != "BetaPart" {
+		t.Fatalf("expected only BetaPart shown in main app, got %+v", appInstance.parts)
+	}
+
+	lmv.searchEntry.SetText("")
+	lmv.statusSelect.SetSelected(libFilterShown)
+	if len(lmv.filteredLibs) != 1 || lmv.filteredLibs[0].Name != "Beta_Sensors" {
+		t.Fatalf("expected Shown status filter to match Beta_Sensors, got %+v", lmv.filteredLibs)
+	}
+	lmv.setFilteredKiCadEnabled(false)
+	if lmv.filteredLibs[0].KiCadEnabled {
+		t.Fatalf("expected Beta_Sensors KiCadEnabled=false after disable")
+	}
+	syms, _, _, err := kicad.LoadEffectiveLibTables(cfg.KiCadConfigDir, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundDisabledBeta := false
+	for _, s := range syms {
+		if s.Name == "Beta_Sensors" && s.Disabled {
+			foundDisabledBeta = true
+		}
+	}
+	if !foundDisabledBeta {
+		t.Fatalf("expected Beta_Sensors marked disabled in sym-lib-table, got %+v", syms)
+	}
+
+	// 3. Un-hide Alpha_MCU too and verify sidebar search filter + quick hide/KiCad toggle
+	if err := database.SetLibraryHidden(libAlpha.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	appInstance.refreshData()
+	if len(appInstance.visibleLibraries) != 2 {
+		t.Fatalf("expected 2 visible libraries, got %d", len(appInstance.visibleLibraries))
+	}
+	appInstance.libSearchEntry.SetText("Alpha")
+	if len(appInstance.libraries) != 1 || appInstance.libraries[0].Name != "Alpha_MCU" {
+		t.Fatalf("expected sidebar filter Alpha to narrow to Alpha_MCU, got %+v", appInstance.libraries)
+	}
+	appInstance.libList.Select(1)
+	if appInstance.selectedLibID != libAlpha.ID {
+		t.Fatalf("expected selectedLibID=%d, got %d", libAlpha.ID, appInstance.selectedLibID)
+	}
+	appInstance.handleToggleSelectedLibraryKiCad()
+	gotAlpha, _ := database.GetLibrary(libAlpha.ID)
+	if gotAlpha.KiCadEnabled {
+		t.Fatalf("expected quick toggle to disable Alpha_MCU in KiCad")
+	}
+	appInstance.handleHideSelectedLibrary()
+	if appInstance.selectedLibID != 0 {
+		t.Fatalf("expected selectedLibID reset to 0 after hiding library")
+	}
+	if len(appInstance.visibleLibraries) != 1 {
+		t.Fatalf("expected 1 visible library after hiding Alpha_MCU, got %d", len(appInstance.visibleLibraries))
+	}
+
+	// 4. PartInspector move target library search filter
+	alphaPart, err := database.GetPart(appInstance.parts[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appInstance.inspector.SetPart(alphaPart)
+	appInstance.inspector.moveFilterEntry.SetText("Gamma")
+	if len(appInstance.inspector.moveSelect.Options) != 1 || appInstance.inspector.moveSelect.Options[0] != "Gamma_Power" {
+		t.Fatalf("expected PartInspector move filter to narrow to Gamma_Power, got %+v", appInstance.inspector.moveSelect.Options)
+	}
+
+	// 5. Staging dialog opens cleanly with target library filter
+	scanRes := &importer.ScanResult{
+		VendorHint: "Test",
+		Candidates: []importer.CandidatePart{{PartName: "NewPart", Value: "1k"}},
+	}
+	ShowDropStagingDialog(w, mgr, scanRes, nil)
+}

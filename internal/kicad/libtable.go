@@ -18,6 +18,7 @@ type LibTableEntry struct {
 	Options      string
 	Description  string
 	ResolvedPath string
+	Disabled     bool
 }
 
 // RegisterSymbolLibrary adds or updates a KiCad symbol library entry in <kicadConfigDir>/sym-lib-table.
@@ -28,6 +29,48 @@ func RegisterSymbolLibrary(kicadConfigDir, libName, libFilePath, description str
 // RegisterFootprintLibrary adds or updates a KiCad footprint library entry in <kicadConfigDir>/fp-lib-table.
 func RegisterFootprintLibrary(kicadConfigDir, libName, prettyDirPath, description string) error {
 	return registerLibTableEntry(filepath.Join(kicadConfigDir, "fp-lib-table"), "fp_lib_table", libName, prettyDirPath, description)
+}
+
+// LibTableToggle describes a single library enable/disable update for sym-lib-table or fp-lib-table.
+type LibTableToggle struct {
+	Name        string
+	URI         string
+	Description string
+	Enabled     bool
+}
+
+// SetSymbolLibraryEnabled enables or disables a symbol library entry in <kicadConfigDir>/sym-lib-table
+// by adding or removing KiCad's `(disabled)` flag on the matching `(lib ...)` node.
+func SetSymbolLibraryEnabled(kicadConfigDir, libName, libFilePath, description string, enabled bool) error {
+	return SetSymbolLibrariesEnabled(kicadConfigDir, []LibTableToggle{{
+		Name:        libName,
+		URI:         libFilePath,
+		Description: description,
+		Enabled:     enabled,
+	}})
+}
+
+// SetFootprintLibraryEnabled enables or disables a footprint library entry in <kicadConfigDir>/fp-lib-table
+// by adding or removing KiCad's `(disabled)` flag on the matching `(lib ...)` node.
+func SetFootprintLibraryEnabled(kicadConfigDir, libName, prettyDirPath, description string, enabled bool) error {
+	return SetFootprintLibrariesEnabled(kicadConfigDir, []LibTableToggle{{
+		Name:        libName,
+		URI:         prettyDirPath,
+		Description: description,
+		Enabled:     enabled,
+	}})
+}
+
+// SetSymbolLibrariesEnabled applies a batch of enable/disable updates to <kicadConfigDir>/sym-lib-table
+// in a single read, parse, backup, and atomic write.
+func SetSymbolLibrariesEnabled(kicadConfigDir string, updates []LibTableToggle) error {
+	return setLibTableEntriesEnabled(filepath.Join(kicadConfigDir, "sym-lib-table"), "sym_lib_table", updates)
+}
+
+// SetFootprintLibrariesEnabled applies a batch of enable/disable updates to <kicadConfigDir>/fp-lib-table
+// in a single read, parse, backup, and atomic write.
+func SetFootprintLibrariesEnabled(kicadConfigDir string, updates []LibTableToggle) error {
+	return setLibTableEntriesEnabled(filepath.Join(kicadConfigDir, "fp-lib-table"), "fp_lib_table", updates)
 }
 
 // UnregisterLibrary removes a library entry from both sym-lib-table and fp-lib-table if present.
@@ -52,12 +95,6 @@ func registerLibTableEntry(tablePath, rootTag, libName, uri, description string)
 		return err
 	}
 
-	if existed {
-		if err := os.WriteFile(tablePath+".bak", rawOld, 0o644); err != nil {
-			return fmt.Errorf("backup %s: %w", tablePath, err)
-		}
-	}
-
 	updated := false
 	for _, libNode := range root.FindChildren("lib") {
 		nameNode := libNode.FindChild("name")
@@ -65,23 +102,111 @@ func registerLibTableEntry(tablePath, rootTag, libName, uri, description string)
 			setLibField(libNode, "type", "KiCad")
 			setLibField(libNode, "uri", uri)
 			setLibField(libNode, "descr", description)
+			libNode.RemoveChildren("disabled")
 			updated = true
 			break
 		}
 	}
 
 	if !updated {
-		entry := List(
-			Atom("lib"),
-			List(Atom("name"), QString(libName)),
-			List(Atom("type"), QString("KiCad")),
-			List(Atom("uri"), QString(uri)),
-			List(Atom("options"), QString("")),
-			List(Atom("descr"), QString(description)),
-		)
-		root.Children = append(root.Children, entry)
+		root.Children = append(root.Children, newLibTableEntryNode(libName, uri, description))
 	}
 
+	return saveLibTable(tablePath, root, existed, rawOld)
+}
+
+func setLibTableEntriesEnabled(tablePath, rootTag string, updates []LibTableToggle) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	hasNonEmptyURI := false
+	for i := range updates {
+		updates[i].Name = strings.TrimSpace(updates[i].Name)
+		if updates[i].Name == "" {
+			return errors.New("library name cannot be empty")
+		}
+		if strings.TrimSpace(updates[i].URI) != "" {
+			hasNonEmptyURI = true
+		}
+	}
+	if _, err := os.Stat(tablePath); errors.Is(err, os.ErrNotExist) && !hasNonEmptyURI {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(tablePath), 0o755); err != nil {
+		return fmt.Errorf("create kicad config dir: %w", err)
+	}
+
+	root, existed, rawOld, err := loadOrInitLibTable(tablePath, rootTag)
+	if err != nil {
+		return err
+	}
+
+	libNodes := root.FindChildren("lib")
+	byName := make(map[string]*Node, len(libNodes))
+	for _, libNode := range libNodes {
+		if nameNode := libNode.FindChild("name"); nameNode != nil {
+			byName[nameNode.Arg(1)] = libNode
+		}
+	}
+
+	changed := false
+	for _, u := range updates {
+		if match := byName[u.Name]; match != nil {
+			if u.URI != "" && fieldValue(match, "uri") == "" {
+				setLibField(match, "uri", u.URI)
+				changed = true
+			}
+			if u.Description != "" && fieldValue(match, "descr") == "" {
+				setLibField(match, "descr", u.Description)
+				changed = true
+			}
+			if u.Enabled {
+				if match.FindChild("disabled") != nil {
+					match.RemoveChildren("disabled")
+					changed = true
+				}
+			} else if match.FindChild("disabled") == nil {
+				match.Children = append(match.Children, List(Atom("disabled")))
+				changed = true
+			}
+			continue
+		}
+
+		if strings.TrimSpace(u.URI) == "" {
+			continue
+		}
+		entry := newLibTableEntryNode(u.Name, u.URI, u.Description)
+		if !u.Enabled {
+			entry.Children = append(entry.Children, List(Atom("disabled")))
+		}
+		root.Children = append(root.Children, entry)
+		byName[u.Name] = entry
+		changed = true
+	}
+
+	if !changed && existed {
+		return nil
+	}
+	return saveLibTable(tablePath, root, existed, rawOld)
+}
+
+func newLibTableEntryNode(libName, uri, description string) *Node {
+	return List(
+		Atom("lib"),
+		List(Atom("name"), QString(libName)),
+		List(Atom("type"), QString("KiCad")),
+		List(Atom("uri"), QString(uri)),
+		List(Atom("options"), QString("")),
+		List(Atom("descr"), QString(description)),
+	)
+}
+
+func saveLibTable(tablePath string, root *Node, existed bool, rawOld []byte) error {
+	if existed {
+		if err := os.WriteFile(tablePath+".bak", rawOld, 0o644); err != nil {
+			return fmt.Errorf("backup %s: %w", tablePath, err)
+		}
+	}
 	return writeAtomic(tablePath, []byte(formatLibTable(root)))
 }
 
@@ -412,16 +537,16 @@ func parseLibTableRecursive(tablePath, rootTag string, vars map[string]string, i
 	}
 
 	var entries []LibTableEntry
+	var nestedTables []string
 	for _, libNode := range root.FindChildren("lib") {
-		if disabledNode := libNode.FindChild("disabled"); disabledNode != nil {
-			continue
-		}
+		isDisabled := libNode.FindChild("disabled") != nil
 		entry := LibTableEntry{
 			Name:        fieldValue(libNode, "name"),
 			Type:        fieldValue(libNode, "type"),
 			URI:         fieldValue(libNode, "uri"),
 			Options:     fieldValue(libNode, "options"),
 			Description: fieldValue(libNode, "descr"),
+			Disabled:    isDisabled,
 		}
 		if entry.URI == "" {
 			continue
@@ -429,20 +554,22 @@ func parseLibTableRecursive(tablePath, rootTag string, vars map[string]string, i
 		entry.ResolvedPath = ExpandKiCadURI(entry.URI, vars)
 
 		if strings.EqualFold(entry.Type, "Table") {
-			if !includeStock {
+			if !includeStock || isDisabled {
 				continue
 			}
-			subTable := resolveNestedTablePath(entry.ResolvedPath, rootTag, vars)
-			if subTable != "" {
-				subEntries, subErr := parseLibTableRecursive(subTable, rootTag, vars, includeStock, depth+1)
-				if subErr == nil {
-					entries = append(entries, subEntries...)
-				}
+			if subTable := resolveNestedTablePath(entry.ResolvedPath, rootTag, vars); subTable != "" {
+				nestedTables = append(nestedTables, subTable)
 			}
 			continue
 		}
 
 		entries = append(entries, entry)
+	}
+	for _, subTable := range nestedTables {
+		subEntries, subErr := parseLibTableRecursive(subTable, rootTag, vars, includeStock, depth+1)
+		if subErr == nil {
+			entries = append(entries, subEntries...)
+		}
 	}
 	return entries, nil
 }
