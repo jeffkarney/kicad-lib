@@ -515,3 +515,44 @@ func TestScanKiCadProjectSchematicAndPCB(t *testing.T) {
 			len(realRes.Candidates), len(realRes.AllFootprints), realRes.Warnings)
 	}
 }
+
+func TestScanDroppedArchivesDeduplicatesModernAndLegacyAndCopies(t *testing.T) {
+	tmp := t.TempDir()
+
+	// Zip with both modern .kicad_sym and legacy .lib
+	zip1Path := filepath.Join(tmp, "part.zip")
+	createZip(t, zip1Path, map[string][]byte{
+		"TPS62130/KiCad/TPS62130.kicad_sym": []byte(sampleTestSym),
+		"TPS62130/KiCad/TPS62130.lib":       []byte(sampleLegacyV5Lib),
+		"TPS62130/KiCad/QFN-16.kicad_mod":   []byte(sampleTestFP),
+	})
+
+	// Duplicate copy of the same zip
+	zip2Path := filepath.Join(tmp, "part copy.zip")
+	data, err := os.ReadFile(zip1Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zip2Path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ScanDroppedPaths([]string{zip1Path, zip2Path}, "")
+	if err != nil {
+		t.Fatalf("ScanDroppedPaths failed: %v", err)
+	}
+	defer res.Cleanup()
+
+	// Should be deduplicated to exactly 1 candidate part
+	if len(res.Candidates) != 1 {
+		var names []string
+		for _, c := range res.Candidates {
+			names = append(names, c.PartName)
+		}
+		t.Fatalf("expected 1 deduplicated candidate, got %d: %v", len(res.Candidates), names)
+	}
+	if res.Candidates[0].PartName != "TPS62130" {
+		t.Fatalf("expected candidate name TPS62130, got %q", res.Candidates[0].PartName)
+	}
+}
+

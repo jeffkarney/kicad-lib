@@ -288,11 +288,15 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 		if name == "" {
 			name = strings.TrimSuffix(filepath.Base(fpf), filepath.Ext(fpf))
 		}
+		fpKey := strings.ToLower(name)
+		if name == "" || seenFPNames[fpKey] {
+			continue
+		}
+		seenFPNames[fpKey] = true
 		var mRefs []string
 		for _, m := range pf.Models {
 			mRefs = append(mRefs, filepath.Base(strings.ReplaceAll(m.Path, "\\", "/")))
 		}
-		seenFPNames[strings.ToLower(name)] = true
 		res.AllFootprints = append(res.AllFootprints, CandidateFootprint{
 			Name:       name,
 			SourcePath: fpf,
@@ -363,12 +367,24 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 		}
 	}
 
-	// Upgrade legacy KiCad v5 .lib files
+	// Upgrade legacy KiCad v5 .lib files (skip if modern .kicad_sym already present for this base name)
 	for idx, lf := range legacyLibFiles {
 		if !isKiCadV5SymbolLib(lf) {
 			continue
 		}
-		upgradedPath := filepath.Join(res.TempWorkDir, fmt.Sprintf("upgraded_%d_%s.kicad_sym", idx, strings.TrimSuffix(filepath.Base(lf), ".lib")))
+		base := strings.TrimSuffix(filepath.Base(lf), ".lib")
+		hasModern := false
+		for _, sf := range symFiles {
+			if strings.EqualFold(strings.TrimSuffix(filepath.Base(sf), ".kicad_sym"), base) {
+				hasModern = true
+				break
+			}
+		}
+		if hasModern {
+			continue
+		}
+
+		upgradedPath := filepath.Join(res.TempWorkDir, fmt.Sprintf("upgraded_%d_%s.kicad_sym", idx, base))
 		if kicadCLIPath != "" {
 			if err := kicad.UpgradeSymbolLib(kicadCLIPath, lf, upgradedPath); err == nil {
 				symFiles = append(symFiles, upgradedPath)
@@ -401,7 +417,11 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 			continue
 		}
 		for _, ps := range parsedSyms {
-			seenSymNames[strings.ToLower(ps.Name)] = true
+			symKey := strings.ToLower(ps.Name)
+			if ps.Name == "" || seenSymNames[symKey] {
+				continue
+			}
+			seenSymNames[symKey] = true
 			symbols = append(symbols, discoveredSymbol{parsed: ps, sourcePath: sf})
 		}
 	}
@@ -539,7 +559,109 @@ func scanDirectories(roots []string, res *ScanResult, kicadCLIPath, sourceType, 
 		}
 	}
 
+	res.Candidates = deduplicateCandidates(res.Candidates)
 	return res, nil
+}
+
+// deduplicateCandidates ensures staged candidate parts have unique names and merges identical candidate duplicates.
+func deduplicateCandidates(candidates []CandidatePart) []CandidatePart {
+	if len(candidates) <= 1 {
+		return candidates
+	}
+	out := make([]CandidatePart, 0, len(candidates))
+	usedNames := make(map[string]int)
+
+	for _, cand := range candidates {
+		nameKey := strings.ToLower(strings.TrimSpace(cand.PartName))
+		if nameKey == "" {
+			continue
+		}
+
+		// Check if an identical candidate is already in `out`
+		isDuplicate := false
+		for i := range out {
+			existing := &out[i]
+			if strings.EqualFold(existing.PartName, cand.PartName) {
+				symMatch := (existing.SymbolSExpr == "" && cand.SymbolSExpr == "") ||
+					(existing.SymbolSExpr != "" && cand.SymbolSExpr != "" &&
+						(existing.SymbolSExpr == cand.SymbolSExpr || existing.SymbolName == cand.SymbolName))
+				fpMatch := (existing.FootprintSExpr == "" && cand.FootprintSExpr == "") ||
+					(existing.FootprintName != "" && existing.FootprintName == cand.FootprintName)
+
+				if symMatch && fpMatch {
+					if existing.Value == "" || existing.Value == existing.PartName {
+						if cand.Value != "" && cand.Value != cand.PartName {
+							existing.Value = cand.Value
+						}
+					}
+					if existing.Description == "" && cand.Description != "" {
+						existing.Description = cand.Description
+					}
+					if existing.Datasheet == "" && cand.Datasheet != "" {
+						existing.Datasheet = cand.Datasheet
+					}
+					if existing.MPN == "" && cand.MPN != "" {
+						existing.MPN = cand.MPN
+					}
+					if existing.Manufacturer == "" && cand.Manufacturer != "" {
+						existing.Manufacturer = cand.Manufacturer
+					}
+					if existing.LCSCPart == "" && cand.LCSCPart != "" {
+						existing.LCSCPart = cand.LCSCPart
+					}
+					if existing.Metadata == nil {
+						existing.Metadata = make(map[string]string)
+					}
+					for k, v := range cand.Metadata {
+						if existing.Metadata[k] == "" {
+							existing.Metadata[k] = v
+						}
+					}
+					for _, cm := range cand.Models3D {
+						hasM := false
+						for _, em := range existing.Models3D {
+							if em.FileName == cm.FileName {
+								hasM = true
+								break
+							}
+						}
+						if !hasM {
+							existing.Models3D = append(existing.Models3D, cm)
+						}
+					}
+					isDuplicate = true
+					break
+				}
+			}
+		}
+
+		if isDuplicate {
+			continue
+		}
+
+		// If this is a distinct candidate but the name is already used, disambiguate it
+		count := usedNames[nameKey]
+		usedNames[nameKey]++
+		if count > 0 {
+			origName := cand.PartName
+			for n := 2; n < 10000; n++ {
+				newName := fmt.Sprintf("%s_%d", origName, n)
+				newKey := strings.ToLower(newName)
+				if usedNames[newKey] == 0 {
+					cand.PartName = newName
+					if cand.Value == origName || cand.Value == "" {
+						cand.Value = newName
+					}
+					usedNames[newKey]++
+					break
+				}
+			}
+		}
+
+		out = append(out, cand)
+	}
+
+	return out
 }
 
 func matchFootprint(ps kicad.ParsedSymbol, fps []CandidateFootprint, singleSymbol bool) int {

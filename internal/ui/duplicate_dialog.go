@@ -38,7 +38,7 @@ func ShowDuplicateCompareDialog(
 	cand *importer.CandidatePart,
 	matches []db.Part,
 	initial storage.MergeOptions,
-	onResolved func(selectedMatch db.Part, opts storage.MergeOptions),
+	onResolved func(selectedMatch db.Part, opts storage.MergeOptions, applyToAll bool),
 ) {
 	if cand == nil || len(matches) == 0 {
 		return
@@ -325,7 +325,7 @@ func ShowDuplicateCompareDialog(
 	))
 
 	var dlg dialog.Dialog
-	applyBtn := widget.NewButtonWithIcon("Apply Resolution", theme.ConfirmIcon(), func() {
+	collectOptions := func() (storage.MergeOptions, bool) {
 		opts := storage.MergeOptions{}
 		switch actionRadio.Selected {
 		case actOverwrite:
@@ -335,7 +335,7 @@ func ShowDuplicateCompareDialog(
 			opts.NewName = strings.TrimSpace(renameEntry.Text)
 			if opts.NewName == "" {
 				dialog.ShowInformation("Name Required", "Enter a new part name.", parent)
-				return
+				return opts, false
 			}
 		case actSkip:
 			opts.Strategy = "skip"
@@ -361,13 +361,31 @@ func ShowDuplicateCompareDialog(
 				opts.MetadataMode = "prefer_incoming"
 			}
 		}
+		return opts, true
+	}
 
+	applyBtn := widget.NewButtonWithIcon("Apply Resolution", theme.ConfirmIcon(), func() {
+		opts, ok := collectOptions()
+		if !ok {
+			return
+		}
 		dlg.Hide()
 		if onResolved != nil {
-			onResolved(matches[selectedIdx], opts)
+			onResolved(matches[selectedIdx], opts, false)
 		}
 	})
 	applyBtn.Importance = widget.HighImportance
+
+	applyAllBtn := widget.NewButtonWithIcon("Apply to All Remaining", theme.ConfirmIcon(), func() {
+		opts, ok := collectOptions()
+		if !ok {
+			return
+		}
+		dlg.Hide()
+		if onResolved != nil {
+			onResolved(matches[selectedIdx], opts, true)
+		}
+	})
 
 	cancelBtn := widget.NewButton("Cancel", func() {
 		dlg.Hide()
@@ -379,7 +397,7 @@ func ShowDuplicateCompareDialog(
 		topMatchBar,
 		container.NewVBox(
 			resolutionCard,
-			container.NewHBox(layout.NewSpacer(), cancelBtn, applyBtn),
+			container.NewHBox(layout.NewSpacer(), cancelBtn, applyAllBtn, applyBtn),
 		),
 		nil, nil,
 		compareTabs,

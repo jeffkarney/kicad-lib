@@ -883,4 +883,211 @@ func TestSetLibraryKiCadEnabledAndRegeneratePreservesDisabled(t *testing.T) {
 	}
 }
 
+func TestImportPartUniqueNameAutoDisambiguation(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad-cfg"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
 
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lib, err := database.CreateLibrary("Diodes", "Test Diodes")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	symSExpr := `(symbol "PMEG6010EXEX"
+		(in_bom yes)
+		(on_board yes)
+		(property "Reference" "D" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "PMEG6010EXEX" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
+		(symbol "PMEG6010EXEX_1_1"
+			(pin passive line (at -2.54 0 0) (length 2.54) (name "A" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+			(pin passive line (at 2.54 0 0) (length 2.54) (name "K" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+		)
+	)`
+
+	req := ImportPartRequest{
+		LibraryID:   lib.ID,
+		PartName:    "PMEG6010EXEX",
+		Value:       "PMEG6010EXEX",
+		SymbolName:  "PMEG6010EXEX",
+		SymbolSExpr: symSExpr,
+	}
+
+	p1, err := mgr.ImportPart(req)
+	if err != nil {
+		t.Fatalf("first ImportPart failed: %v", err)
+	}
+	if p1.Name != "PMEG6010EXEX" {
+		t.Fatalf("expected p1.Name == PMEG6010EXEX, got %q", p1.Name)
+	}
+
+	p2, err := mgr.ImportPart(req)
+	if err != nil {
+		t.Fatalf("second ImportPart failed: %v", err)
+	}
+	if p2.Name != "PMEG6010EXEX_2" {
+		t.Fatalf("expected p2.Name == PMEG6010EXEX_2, got %q", p2.Name)
+	}
+
+	p3, err := mgr.ImportPart(req)
+	if err != nil {
+		t.Fatalf("third ImportPart failed: %v", err)
+	}
+	if p3.Name != "PMEG6010EXEX_3" {
+		t.Fatalf("expected p3.Name == PMEG6010EXEX_3, got %q", p3.Name)
+	}
+
+	// Verify GetPartByName in db
+	found1, err := database.GetPartByName(lib.ID, "pmeg6010exex")
+	if err != nil || found1.ID != p1.ID {
+		t.Fatalf("expected GetPartByName to find p1, err=%v", err)
+	}
+	found2, err := database.GetPartByName(lib.ID, "PMEG6010EXEX_2")
+	if err != nil || found2.ID != p2.ID {
+		t.Fatalf("expected GetPartByName to find p2, err=%v", err)
+	}
+
+	// Verify exported EnsureUniquePartName
+	nextName := mgr.EnsureUniquePartName(lib.ID, "PMEG6010EXEX")
+	if nextName != "PMEG6010EXEX_4" {
+		t.Fatalf("expected next name PMEG6010EXEX_4, got %q", nextName)
+	}
+}
+
+func TestMergePartCrossLibraryMoveAndOverwrite(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad-cfg"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	libSource, err := database.CreateLibrary("SourceLib", "Source Library")
+	if err != nil {
+		t.Fatal(err)
+	}
+	libTarget, err := database.CreateLibrary("TargetLib", "Target Library")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	symRaw := `(symbol "TEST_PART"
+		(in_bom yes)
+		(on_board yes)
+		(property "Reference" "U" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "TEST_PART" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
+		(property "Footprint" "SourceLib:FP_TEST" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+		(symbol "TEST_PART_1_1"
+			(pin input line (at -5.08 0 0) (length 2.54) (name "IN" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+		)
+	)`
+	fpRaw := `(footprint "FP_TEST"
+		(layer "F.Cu")
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask"))
+	)`
+
+	pOrig, err := mgr.ImportPart(ImportPartRequest{
+		LibraryID:      libSource.ID,
+		PartName:       "TEST_PART",
+		Value:          "TEST_PART",
+		Description:    "Initial part in source library",
+		SourceType:     "drop",
+		SymbolName:     "TEST_PART",
+		SymbolSExpr:    symRaw,
+		FootprintName:  "FP_TEST",
+		FootprintSExpr: fpRaw,
+	})
+	if err != nil {
+		t.Fatalf("ImportPart into SourceLib failed: %v", err)
+	}
+
+	// Verify part exists in SourceLib
+	sourceParts, err := database.ListPartsByLibrary(libSource.ID)
+	if err != nil || len(sourceParts) != 1 {
+		t.Fatalf("expected 1 part in SourceLib, got %d (err=%v)", len(sourceParts), err)
+	}
+
+	// Overwrite duplicate into TargetLib
+	incReq := ImportPartRequest{
+		LibraryID:      libTarget.ID,
+		PartName:       "TEST_PART",
+		Value:          "TEST_PART_V2",
+		Description:    "Overwritten part now in TargetLib",
+		SourceType:     "drop",
+		SymbolName:     "TEST_PART",
+		SymbolSExpr:    symRaw,
+		FootprintName:  "FP_TEST",
+		FootprintSExpr: fpRaw,
+	}
+
+	moved, err := mgr.MergePart(pOrig.ID, incReq, MergeOptions{
+		Strategy: "overwrite",
+	})
+	if err != nil {
+		t.Fatalf("MergePart cross-library overwrite failed: %v", err)
+	}
+
+	if moved.LibraryID != libTarget.ID {
+		t.Fatalf("expected moved part LibraryID == %d (TargetLib), got %d", libTarget.ID, moved.LibraryID)
+	}
+
+	// SourceLib should now have 0 parts, TargetLib should have 1 part
+	sourceParts, _ = database.ListPartsByLibrary(libSource.ID)
+	if len(sourceParts) != 0 {
+		t.Fatalf("expected 0 parts in SourceLib, got %d", len(sourceParts))
+	}
+	targetParts, _ := database.ListPartsByLibrary(libTarget.ID)
+	if len(targetParts) != 1 || targetParts[0].ID != pOrig.ID {
+		t.Fatalf("expected 1 part in TargetLib with ID=%d, got %+v", pOrig.ID, targetParts)
+	}
+
+	// Check disk files: TargetLib.kicad_sym must contain symbol with TargetLib footprint ref
+	targetSymPath := filepath.Join(cfg.SymbolsDir(), "TargetLib.kicad_sym")
+	targetSymBytes, err := os.ReadFile(targetSymPath)
+	if err != nil {
+		t.Fatalf("read TargetLib.kicad_sym failed: %v", err)
+	}
+	if !strings.Contains(string(targetSymBytes), `(symbol "TEST_PART"`) {
+		t.Fatalf("TargetLib.kicad_sym missing symbol TEST_PART")
+	}
+	if !strings.Contains(string(targetSymBytes), `TargetLib:FP_TEST`) {
+		t.Fatalf("TargetLib.kicad_sym expected footprint ref TargetLib:FP_TEST, got:\n%s", string(targetSymBytes))
+	}
+
+	// SourceLib.kicad_sym must NOT contain TEST_PART
+	sourceSymPath := filepath.Join(cfg.SymbolsDir(), "SourceLib.kicad_sym")
+	sourceSymBytes, err := os.ReadFile(sourceSymPath)
+	if err != nil {
+		t.Fatalf("read SourceLib.kicad_sym failed: %v", err)
+	}
+	if strings.Contains(string(sourceSymBytes), `(symbol "TEST_PART"`) {
+		t.Fatalf("SourceLib.kicad_sym still contains symbol TEST_PART after move")
+	}
+}

@@ -57,6 +57,8 @@ type ImportPartRequest struct {
 
 	Models3D []ImportModel3D
 	Metadata map[string]string
+
+	SkipRegenerate bool // skip RegenerateLibrary and IPC notification (e.g., for batch imports)
 }
 
 // SyncProgress reports live progress while pulling and syncing existing KiCad libraries.
@@ -127,6 +129,7 @@ func (m *Manager) ImportPart(req ImportPartRequest) (*db.Part, error) {
 	if partName == "" {
 		return nil, errors.New("part name cannot be empty")
 	}
+	partName = m.ensureUniquePartNameIfExists(lib.ID, partName)
 	if req.Value == "" {
 		req.Value = partName
 	}
@@ -333,10 +336,12 @@ func (m *Manager) ImportPart(req ImportPartRequest) (*db.Part, error) {
 		return nil, err
 	}
 
-	if err := m.RegenerateLibrary(lib.ID); err != nil {
-		return nil, fmt.Errorf("regenerate library %q: %w", lib.Name, err)
+	if !req.SkipRegenerate {
+		if err := m.RegenerateLibrary(lib.ID); err != nil {
+			return nil, fmt.Errorf("regenerate library %q: %w", lib.Name, err)
+		}
+		m.notifyIPC()
 	}
-	m.notifyIPC()
 
 	return m.db.GetPart(part.ID)
 }
@@ -350,6 +355,7 @@ type MergeOptions struct {
 	UseIncomingFootprint bool   // replace existing footprint with incoming footprint
 	Model3DMode          string // "combine", "keep_existing", "use_incoming"
 	MetadataMode         string // "prefer_incoming", "keep_existing", "replace"
+	SkipRegenerate       bool   // skip RegenerateLibrary and IPC notification (e.g., for batch operations)
 }
 
 // MergePart resolves a duplicate import against existingPartID using the specified merge strategy.
@@ -382,6 +388,7 @@ func (m *Manager) MergePart(existingPartID int64, req ImportPartRequest, opts Me
 			newName = m.ensureUniquePartNameIfExists(req.LibraryID, newName)
 		}
 		req.PartName = newName
+		req.SkipRegenerate = opts.SkipRegenerate
 		return m.ImportPart(req)
 
 	case "overwrite":
@@ -394,9 +401,13 @@ func (m *Manager) MergePart(existingPartID int64, req ImportPartRequest, opts Me
 			UseIncomingFootprint: hasIncFP,
 			Model3DMode:          "use_incoming",
 			MetadataMode:         "replace",
+			SkipRegenerate:       opts.SkipRegenerate,
 		})
 
 	case "merge":
+		oldLibID := existing.LibraryID
+		movingToNewLib := req.LibraryID > 0 && req.LibraryID != existing.LibraryID
+
 		if existing.SourceType == "kicad_sync" {
 			if err := m.materializePartToVault(existing); err != nil {
 				return nil, fmt.Errorf("materialize synced part to vault: %w", err)
@@ -405,6 +416,21 @@ func (m *Manager) MergePart(existingPartID int64, req ImportPartRequest, opts Me
 				existing.SourceType = req.SourceType
 			} else {
 				existing.SourceType = "manual"
+			}
+		} else if movingToNewLib && req.SourceType != "" {
+			existing.SourceType = req.SourceType
+		}
+
+		if movingToNewLib {
+			existing.LibraryID = req.LibraryID
+			existing.LibraryName = ""
+			existing.Name = m.ensureUniquePartNameIfExists(req.LibraryID, existing.Name)
+		}
+
+		if opts.UseIncomingDetails && strings.TrimSpace(req.PartName) != "" {
+			candName := sanitizeFileComponent(strings.TrimSpace(req.PartName))
+			if candName != "" && candName != existing.Name {
+				existing.Name = m.ensureUniquePartNameIfExists(existing.LibraryID, candName)
 			}
 		}
 
@@ -653,11 +679,18 @@ func (m *Manager) MergePart(existingPartID int64, req ImportPartRequest, opts Me
 		if err := m.db.SavePart(existing); err != nil {
 			return nil, err
 		}
-		if err := m.RegenerateLibrary(existing.LibraryID); err != nil {
-			return nil, fmt.Errorf("regenerate library %q: %w", lib.Name, err)
+		if !opts.SkipRegenerate {
+			if movingToNewLib {
+				if oldLib, err := m.db.GetLibrary(oldLibID); err == nil && oldLib.SourceURI == "" && oldLib.FPSourceURI == "" {
+					_ = m.RegenerateLibrary(oldLibID)
+				}
+			}
+			if err := m.RegenerateLibrary(existing.LibraryID); err != nil {
+				return nil, fmt.Errorf("regenerate library %q: %w", lib.Name, err)
+			}
+			m.notifyIPC()
 		}
 		m.invalidatePreviewCache(existing.UUID)
-		m.notifyIPC()
 		return m.db.GetPart(existing.ID)
 
 	default:
@@ -711,6 +744,11 @@ func (m *Manager) ensureUniquePartNameIfExists(libraryID int64, candidate string
 		return candidate
 	}
 	return m.uniquePartNameInLibrary(libraryID, candidate)
+}
+
+// EnsureUniquePartName ensures candidate part name is unique within libraryID, suffixing _2, _3 if already taken.
+func (m *Manager) EnsureUniquePartName(libraryID int64, candidate string) string {
+	return m.ensureUniquePartNameIfExists(libraryID, candidate)
 }
 
 // RegenerateLibrary rebuilds the .kicad_sym, .pretty, and .3dshapes files on disk for libraryID
@@ -1759,6 +1797,11 @@ func (m *Manager) notifyIPC() {
 	if m.ipc != nil {
 		go m.ipc.RefreshLibrariesAndNotify()
 	}
+}
+
+// NotifyIPC signals KiCad over IPC that libraries have changed.
+func (m *Manager) NotifyIPC() {
+	m.notifyIPC()
 }
 
 func copyFile(src, dst string) error {

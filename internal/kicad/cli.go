@@ -24,7 +24,7 @@ func UpgradeSymbolLib(cliPath, inputLibPath, outputKicadSymPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, cliPath, "sym", "upgrade", "--force", "--output", outputKicadSymPath, inputLibPath)
+	cmd := cleanKiCadCLICommand(ctx, cliPath, "sym", "upgrade", "--force", "--output", outputKicadSymPath, inputLibPath)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -52,7 +52,7 @@ func UpgradeFootprintDir(cliPath, inputPath, outputDir string) error {
 	}
 	args = append(args, inputPath)
 
-	cmd := exec.CommandContext(ctx, cliPath, args...)
+	cmd := cleanKiCadCLICommand(ctx, cliPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -79,7 +79,7 @@ func ExportSymbolSVG(cliPath, symLibPath, symbolName, outDir string) (string, er
 	}
 	args = append(args, symLibPath)
 
-	cmd := exec.CommandContext(ctx, cliPath, args...)
+	cmd := cleanKiCadCLICommand(ctx, cliPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -107,7 +107,7 @@ func ExportFootprintSVG(cliPath, prettyDirOrFile, footprintName, outDir string) 
 	}
 	args = append(args, prettyDirOrFile)
 
-	cmd := exec.CommandContext(ctx, cliPath, args...)
+	cmd := cleanKiCadCLICommand(ctx, cliPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -115,6 +115,19 @@ func ExportFootprintSVG(cliPath, prettyDirOrFile, footprintName, outDir string) 
 	}
 
 	return findFirstSVG(outDir, footprintName)
+}
+
+func cleanKiCadCLICommand(ctx context.Context, cliPath string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, cliPath, args...)
+	var cleanEnv []string
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "LD_LIBRARY_PATH=") {
+			continue
+		}
+		cleanEnv = append(cleanEnv, env)
+	}
+	cmd.Env = cleanEnv
+	return cmd
 }
 
 func findFirstSVG(dir, preferredPrefix string) (string, error) {

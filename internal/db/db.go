@@ -787,6 +787,35 @@ func (d *DB) GetPart(id int64) (*Part, error) {
 	return &p, nil
 }
 
+// GetPartByName fetches a part by library ID and case-insensitive part name.
+func (d *DB) GetPartByName(libraryID int64, name string) (*Part, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("part name cannot be empty")
+	}
+	row := d.conn.QueryRow(`
+		SELECT p.id, p.uuid, p.library_id, l.name, p.name, p.value, p.description, p.keywords,
+		       p.datasheet, p.mpn, p.manufacturer, p.lcsc_part, p.source_type, p.source_ref,
+		       p.created_at, p.updated_at
+		FROM parts p
+		JOIN libraries l ON l.id = p.library_id
+		WHERE p.library_id = ? AND LOWER(p.name) = LOWER(?)`, libraryID, name)
+
+	var p Part
+	err := row.Scan(
+		&p.ID, &p.UUID, &p.LibraryID, &p.LibraryName, &p.Name, &p.Value, &p.Description, &p.Keywords,
+		&p.Datasheet, &p.MPN, &p.Manufacturer, &p.LCSCPart, &p.SourceType, &p.SourceRef,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.hydratePartRelations(&p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 func (d *DB) hydratePartRelations(p *Part) error {
 	// Symbol
 	var sym Symbol

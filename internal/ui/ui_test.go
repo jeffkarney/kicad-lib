@@ -443,3 +443,60 @@ func TestLibraryVisibilitySearchAndKiCadToggleHeadless(t *testing.T) {
 	}
 	ShowDropStagingDialog(w, mgr, scanRes, nil)
 }
+
+func TestDropStagingDialogBatchIntraDuplicates(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:    filepath.Join(tmp, "storage"),
+		KiCadConfigDir: filepath.Join(tmp, "kicad-cfg"),
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mgr, err := storage.NewManager(cfg, database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lib, err := database.CreateLibrary("Jeff K", "Test Lib")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := test.NewApp()
+	defer a.Quit()
+	w := test.NewWindow(nil)
+	defer w.Close()
+
+	scanRes := &importer.ScanResult{
+		VendorHint: "SamacSys",
+		Candidates: []importer.CandidatePart{
+			{Selected: true, PartName: "PMEG6010EXEX", Value: "PMEG6010EXEX"},
+			{Selected: true, PartName: "PMEG6010EXEX", Value: "PMEG6010EXEX"},
+			{Selected: true, PartName: "DR125-330-R", Value: "DR125-330-R"},
+			{Selected: true, PartName: "DR125-330-R", Value: "DR125-330-R"},
+		},
+	}
+
+	ShowDropStagingDialog(w, mgr, scanRes, nil)
+
+	// Verify importing candidates directly with manager never fails unique constraint
+	p1, err := mgr.ImportPart(storage.ImportPartRequest{LibraryID: lib.ID, PartName: "PMEG6010EXEX"})
+	if err != nil {
+		t.Fatalf("p1 failed: %v", err)
+	}
+	p2, err := mgr.ImportPart(storage.ImportPartRequest{LibraryID: lib.ID, PartName: "PMEG6010EXEX"})
+	if err != nil {
+		t.Fatalf("p2 failed: %v", err)
+	}
+	if p1.Name == p2.Name {
+		t.Fatalf("expected distinct names for duplicate import, got %q and %q", p1.Name, p2.Name)
+	}
+}

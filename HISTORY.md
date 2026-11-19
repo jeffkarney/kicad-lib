@@ -151,6 +151,26 @@ nix-shell --run "./bin/kicad-lib"
       - **Bulk KiCad Toggle Performance Optimization**: Replaced per-library `ListPartsByLibrary` (which hydrated every part and re-parsed `.kicad_sym`/`.kicad_mod` files on disk) and per-library `sym-lib-table`/`fp-lib-table` rewrites with a single SQL query `DB.ListLibraryIDsWithManagedParts()`, a single `DB.ListLibraries()` lookup, and single-pass batch `kicad.SetSymbolLibrariesEnabled` / `SetFootprintLibrariesEnabled` updates (also speeding up `RegenerateAllLibraries`).
       - **Test Isolation**: Gated `TestLiveKiCadSync` behind `KICAD_LIVE_TEST=1` in `internal/storage/manager_test.go` so routine `go test ./...` runs stay isolated from the host user database and KiCad config.
 
+11. **Fix Import UNIQUE Constraint Failed (`parts.library_id, parts.name`) Errors**:
+    - *Issue*: Dropping component archives (such as SamacSys / ComponentSearchEngine zips or duplicate copies like `... copy.zip`) produced `UNIQUE constraint failed: parts.library_id, parts.name (2067)` SQLite errors. Modern KiCad v6+ `.kicad_sym` and legacy KiCad v5 `.lib` files were both being converted and parsed into duplicate candidate parts in the same batch. Since they did not exist in the database prior to import, pre-import database checks did not flag them. On import, the first candidate succeeded, but subsequent candidates in the batch triggered SQLite unique constraint violations.
+    - *Fix*:
+      - In `internal/importer/archive.go`: Fixed missing checks on `seenSymNames` and `seenFPNames` during symbol/footprint collection. Skipped legacy `.lib` conversion if a modern `.kicad_sym` is already present for that component. Implemented `deduplicateCandidates` to automatically deduplicate identical candidates and auto-disambiguate distinct candidates with identical names.
+      - In `internal/db/db.go`: Added `GetPartByName(libraryID int64, name string)` for exact case-insensitive part lookup within a specific library.
+      - In `internal/storage/manager.go`: In `ImportPart`, added `ensureUniquePartNameIfExists` so blind imports never crash with unique constraint violations. Added `SkipRegenerate` to `ImportPartRequest` and `MergeOptions` to avoid $N$ redundant disk regenerations and IPC storms during batch imports. Exported `EnsureUniquePartName` and `NotifyIPC`.
+      - In `internal/ui/drop_dialog.go`: In `executeImport`, checked `GetPartByName` on the target library before importing each candidate to detect pre-existing or intra-batch duplicates, defaulting to safe merge or rename strategies. Added single batch regeneration and IPC notification at the end of the batch import.
+      - In `internal/kicad/cli.go`: Isolated `kicad-cli` execution from polluted host `LD_LIBRARY_PATH` variables.
+      - Added regression tests `TestScanDroppedArchivesDeduplicatesModernAndLegacyAndCopies` in `internal/importer/archive_test.go`, `TestImportPartUniqueNameAutoDisambiguation` in `internal/storage/manager_test.go`, and `TestDropStagingDialogBatchIntraDuplicates` in `internal/ui/ui_test.go`.
+
+12. **Fix Duplicate Overwrite/Merge Target Library Assignment & Batch Resolution Actions**:
+    - *Issue*: When importing parts into a user-selected target library (e.g. "Jeff K"), duplicate parts that matched existing parts in the database (including external synced libraries like `PCM_Diode_AKL` or other component libraries) were merged or overwritten in their original library rather than being moved to the selected target library. In addition, batch imports only regenerated the target library, leaving source libraries out of sync on disk, and users had to manually resolve each duplicate sequentially without a quick batch overwrite option.
+    - *Fix*:
+      - In `internal/storage/manager.go` (`MergePart`): When `req.LibraryID > 0 && req.LibraryID != existing.LibraryID`, the part is moved to `req.LibraryID`. Synced KiCad parts (`kicad_sync`) are materialized into the vault and converted to user-managed parts (`drop`/`manual`). The part's `library_id` is updated in SQLite, and symbol footprint references are updated to `TargetLib:FootprintName`. In regeneration, both the target library and any internal managed source library are regenerated on disk (`.kicad_sym`, `.pretty`, `.3dshapes`).
+      - In `internal/ui/drop_dialog.go` (`executeImport`): Tracked all affected library IDs during batch operations (`affectedLibIDs`) and regenerated every affected managed library after import.
+      - In `internal/ui/drop_dialog.go`: Added an `[Overwrite All]` button directly to the duplicate notification banner for 1-click batch duplicate overwrite. Updated the sequential resolution queue (`stepNext`) to advance past duplicates already resolved via batch actions.
+      - In `internal/ui/duplicate_dialog.go` (`ShowDuplicateCompareDialog`): Added an `[Apply to All Remaining]` button next to `[Apply Resolution]` to allow users to apply their chosen strategy across all remaining unresolved duplicates in one click.
+      - Added regression test `TestMergePartCrossLibraryMoveAndOverwrite` in `internal/storage/manager_test.go`.
+      - Migrated the 7 parts from the user's previous import session into library "Jeff K" (ID 348) and regenerated all symbols, footprints, and 3D shapes on disk.
+
 ---
 
 ## 5. Key Invariants & Gotchas for Future Changes

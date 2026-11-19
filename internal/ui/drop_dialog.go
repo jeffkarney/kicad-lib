@@ -127,9 +127,11 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 
 	var candDupBtn *widget.Button
 	dupBannerCompareBtn := widget.NewButton("Compare Active Duplicate...", nil)
+	dupBannerOverwriteAllBtn := widget.NewButtonWithIcon("Overwrite All", theme.ConfirmIcon(), nil)
+	dupBannerActions := container.NewHBox(dupBannerOverwriteAllBtn, dupBannerCompareBtn)
 	dupBanner := container.NewStack(
 		dupBannerBg,
-		container.NewPadded(container.NewBorder(nil, nil, widget.NewIcon(theme.WarningIcon()), dupBannerCompareBtn, dupBannerLbl)),
+		container.NewPadded(container.NewBorder(nil, nil, widget.NewIcon(theme.WarningIcon()), dupBannerActions, dupBannerLbl)),
 	)
 	dupBanner.Hide()
 
@@ -194,9 +196,26 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		}
 		r := resolutions[activeIdx]
 		if len(r.AllMatches) == 0 {
+			hasBatchDup := false
+			activeName := strings.ToLower(strings.TrimSpace(res.Candidates[activeIdx].PartName))
+			if activeName != "" {
+				for j, oc := range res.Candidates {
+					if j != activeIdx && strings.ToLower(strings.TrimSpace(oc.PartName)) == activeName {
+						hasBatchDup = true
+						break
+					}
+				}
+			}
+			if hasBatchDup {
+				candDupBar.Show()
+				candDupBtn.Hide()
+				candDupStatusLbl.SetText(fmt.Sprintf("ℹ Part name %q is also used by another candidate in this batch; duplicates will be safely merged or disambiguated.", res.Candidates[activeIdx].PartName))
+				return
+			}
 			candDupBar.Hide()
 			return
 		}
+		candDupBtn.Show()
 		candDupBar.Show()
 		ex := r.DuplicatePart
 		if ex == nil {
@@ -292,10 +311,20 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		ShowDuplicateCompareDialog(
 			stageWin, mgr, currentTargetLibID(),
 			&res.Candidates[idx], resolutions[idx].AllMatches, resolutions[idx].Options,
-			func(selectedMatch db.Part, opts storage.MergeOptions) {
+			func(selectedMatch db.Part, opts storage.MergeOptions, applyToAll bool) {
 				resolutions[idx].DuplicatePart = &selectedMatch
 				resolutions[idx].Resolved = true
 				resolutions[idx].Options = opts
+				if applyToAll {
+					for j := range resolutions {
+						if len(resolutions[j].AllMatches) > 0 && !resolutions[j].Resolved {
+							mCopy := resolutions[j].AllMatches[0]
+							resolutions[j].DuplicatePart = &mCopy
+							resolutions[j].Resolved = true
+							resolutions[j].Options = opts
+						}
+					}
+				}
 				updateBannerCounts()
 				if onDone != nil {
 					onDone()
@@ -306,6 +335,20 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 
 	candDupBtn.OnTapped = func() {
 		openCompareForIdx(activeIdx, nil)
+	}
+
+	dupBannerOverwriteAllBtn.OnTapped = func() {
+		for j := range resolutions {
+			if len(resolutions[j].AllMatches) > 0 {
+				mCopy := resolutions[j].AllMatches[0]
+				resolutions[j].DuplicatePart = &mCopy
+				resolutions[j].Resolved = true
+				resolutions[j].Options = storage.MergeOptions{
+					Strategy: "overwrite",
+				}
+			}
+		}
+		updateBannerCounts()
 	}
 
 	// Hook banner button cleanly so count label refreshes too
@@ -669,6 +712,7 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		importedCount := 0
 		mergedCount := 0
 		skippedCount := 0
+		affectedLibIDs := map[int64]bool{targetLib.ID: true}
 
 		for i, c := range res.Candidates {
 			if !c.Selected {
@@ -702,18 +746,40 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 				FootprintSExpr:      c.FootprintSExpr,
 				Models3D:            models,
 				Metadata:            c.Metadata,
+				SkipRegenerate:      true,
 			}
 
 			r := resolutions[i]
-			if r.DuplicatePart != nil && r.Resolved {
-				if strings.EqualFold(r.Options.Strategy, "skip") {
+			// Check if a part with this name already exists in targetLib (pre-existing or imported earlier in this batch)
+			existingInTarget, _ := mgr.DB().GetPartByName(targetLib.ID, c.PartName)
+			if existingInTarget != nil && (r.DuplicatePart == nil || r.DuplicatePart.LibraryID != targetLib.ID) {
+				r.DuplicatePart = existingInTarget
+			}
+
+			if r.DuplicatePart != nil {
+				opts := r.Options
+				opts.SkipRegenerate = true
+				if !r.Resolved {
+					// Safe default for unresolved duplicate: merge incoming assets/details
+					opts.Strategy = "merge"
+					opts.UseIncomingDetails = true
+					opts.UseIncomingSymbol = strings.TrimSpace(req.SymbolSExpr) != "" || strings.TrimSpace(req.SymbolSourcePath) != ""
+					opts.UseIncomingFootprint = strings.TrimSpace(req.FootprintSExpr) != "" || strings.TrimSpace(req.FootprintSourcePath) != ""
+					opts.Model3DMode = "combine"
+					opts.MetadataMode = "prefer_incoming"
+				}
+
+				if strings.EqualFold(opts.Strategy, "skip") {
 					skippedCount++
 					continue
 				}
-				_, err := mgr.MergePart(r.DuplicatePart.ID, req, r.Options)
+				if r.DuplicatePart.LibraryID != targetLib.ID {
+					affectedLibIDs[r.DuplicatePart.LibraryID] = true
+				}
+				_, err := mgr.MergePart(r.DuplicatePart.ID, req, opts)
 				if err != nil {
 					errs = append(errs, fmt.Sprintf("%s: %v", c.PartName, err))
-				} else if strings.EqualFold(r.Options.Strategy, "rename") {
+				} else if strings.EqualFold(opts.Strategy, "rename") {
 					importedCount++
 				} else {
 					mergedCount++
@@ -726,6 +792,24 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 					importedCount++
 				}
 			}
+		}
+
+		// Perform batch regeneration for all affected libraries and IPC notification
+		if importedCount > 0 || mergedCount > 0 {
+			for libID := range affectedLibIDs {
+				if libID == targetLib.ID {
+					if err := mgr.RegenerateLibrary(libID); err != nil {
+						errs = append(errs, fmt.Sprintf("regenerate library %q: %v", targetLib.Name, err))
+					}
+				} else {
+					if oldLib, err := mgr.DB().GetLibrary(libID); err == nil && oldLib.SourceURI == "" && oldLib.FPSourceURI == "" {
+						if err := mgr.RegenerateLibrary(libID); err != nil {
+							errs = append(errs, fmt.Sprintf("regenerate library %q: %v", oldLib.Name, err))
+						}
+					}
+				}
+			}
+			mgr.NotifyIPC()
 		}
 
 		stageWin.Close()
@@ -802,6 +886,9 @@ func ShowDropStagingDialog(parent fyne.Window, mgr *storage.Manager, res *import
 		// Step sequentially through unresolved duplicates
 		var stepNext func(qPos int)
 		stepNext = func(qPos int) {
+			for qPos < len(unresolvedQueue) && resolutions[unresolvedQueue[qPos]].Resolved {
+				qPos++
+			}
 			if qPos >= len(unresolvedQueue) {
 				executeImport(targetLib)
 				return
